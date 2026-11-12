@@ -3,10 +3,14 @@ name: Batch Zip -> WebP
 on:
   workflow_dispatch:
     inputs:
+      urls:
+        description: "下载链接(每行一个,支持多个)"
+        required: true
+        type: string
       quality:
         description: "WebP 质量 (1-100)"
         required: false
-        default: "80"
+        default: "90"
       max_size:
         description: "最大边长(像素,留空表示不缩放)"
         required: false
@@ -14,17 +18,11 @@ on:
       compress_level:
         description: "zip 压缩级别 1-9(越大越慢)"
         required: false
-        default: "6"
+        default: "1"
       downloader:
         description: "下载器 auto / gallery-dl / requests"
         required: false
         default: "auto"
-  push:
-    paths:
-      - "urls.txt"
-      - "scripts/process.py"
-      - "requirements.txt"
-      - ".github/workflows/process.yml"
 
 permissions:
   contents: write
@@ -32,7 +30,10 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
+    concurrency:
+      group: batch-zip-webp
+      cancel-in-progress: false
 
     steps:
       - name: Checkout
@@ -49,35 +50,36 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # gallery-dl 已在 requirements.txt 中,这里再做一次显式安装与版本确认,
-      # 保证 CLI 可用并把版本打进 CI 日志,方便排查 403 问题。
       - name: Install gallery-dl
         run: |
           pip install gallery-dl
           python -m gallery_dl --version
 
+      # 把手动输入的链接写到临时 urls.txt,供脚本读取。
+      - name: Write urls.txt
+        env:
+          INPUT_URLS: ${{ inputs.urls }}
+        run: |
+          printf '%s\n' "$INPUT_URLS" > urls.txt
+          echo "=== urls.txt ==="
+          cat urls.txt
+
       - name: Run process
         env:
-          QUALITY: ${{ github.event.inputs.quality || '80' }}
-          MAX_SIZE: ${{ github.event.inputs.max_size || '' }}
-          COMPRESS_LEVEL: ${{ github.event.inputs.compress_level || '6' }}
-          DOWNLOADER: ${{ github.event.inputs.downloader || 'auto' }}
-          # 可选:在仓库 Settings -> Secrets 里配置浏览器 Cookie / 自定义请求头,
-          # 用于绕过站点的 403 限制;未配置时为空,不影响普通下载。
+          QUALITY: ${{ inputs.quality || '90' }}
+          MAX_SIZE: ${{ inputs.max_size || '' }}
+          COMPRESS_LEVEL: ${{ inputs.compress_level || '1' }}
+          DOWNLOADER: ${{ inputs.downloader || 'auto' }}
           DOWNLOAD_HEADERS: ${{ secrets.DOWNLOAD_HEADERS }}
           DOWNLOAD_COOKIE: ${{ secrets.DOWNLOAD_COOKIE }}
-          # 站点要求「可标识的 UA」,伪装浏览器会被 403;可用 secret 换成带真实联系方式的 UA。
           DOWNLOAD_USER_AGENT: ${{ secrets.DOWNLOAD_USER_AGENT }}
         run: |
-          EXTRA=""
-          if [ -n "$MAX_SIZE" ]; then EXTRA="--max-size $MAX_SIZE"; fi
-          python scripts/process.py \
-            --urls urls.txt \
-            --output output \
-            --quality "$QUALITY" \
-            --compress-level "$COMPRESS_LEVEL" \
-            --downloader "$DOWNLOADER" \
-            $EXTRA
+          ARGS=(--urls urls.txt --output output
+                --quality "$QUALITY"
+                --compress-level "$COMPRESS_LEVEL"
+                --downloader "$DOWNLOADER")
+          if [ -n "$MAX_SIZE" ]; then ARGS+=(--max-size "$MAX_SIZE"); fi
+          python scripts/process.py "${ARGS[@]}"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -87,7 +89,6 @@ jobs:
           if-no-files-found: error
 
       - name: Create Release
-        if: github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
