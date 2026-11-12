@@ -52,8 +52,9 @@ def parse_extra_headers(raw: str) -> dict:
             headers[k.strip()] = v.strip()
     return headers
 
-# ==================== 文件名解析（保包名用） ====================
+# ==================== 文件名解析（严格保留原包名） ====================
 def sanitize_name(name: str) -> str:
+    # 仅处理文件系统绝对无法写入的字符，其余（中文、空格、括号等）全部保留
     name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name)
     name = name.strip().strip(".")
     return name or "archive.zip"
@@ -68,7 +69,7 @@ def derive_filename(url: str, index: int, used: set) -> str:
             break
     if not name:
         name = parsed.path.rstrip("/").split("/")[-1] or f"archive_{index}.zip"
-    name = Path(name).name
+    name = Path(name).name # 防止路径穿越
     if not name.lower().endswith(".zip"):
         name = f"{name}.zip"
     name = sanitize_name(name)
@@ -145,9 +146,10 @@ def download(url: str, dest: Path, timeout: int = 300, downloader: str = "auto",
 
 # ==================== 图片压缩核心逻辑 ====================
 def compress_worker(args):
-    orig_name, src_path, dst_path, target_quality, max_size = args
+    orig_name, src_path, dst_path, default_quality, max_size = args
     ext = Path(orig_name).suffix.lower()
     size = src_path.stat().st_size
+    
     info = {
         "orig_name": orig_name,
         "ext": ext,
@@ -160,18 +162,27 @@ def compress_worker(args):
         "error": None,
     }
 
-    # 规则 1 & 2: 不转换
+    # --- 规则：什么情况不转换 ---
+    
+    # 1. 原文件是 webp
     if ext == ".webp":
         info["reason"] = "已是 webp"
         return (orig_name, False, None, info, None)
-    if ext == ".png" and size <= 500 * 1024:
-        info["reason"] = "png 且 <=500KB"
+        
+    # 2. PNG <= 800KB
+    if ext == ".png" and size <= 800 * 1024:
+        info["reason"] = "png 且 <=800KB"
+        return (orig_name, False, None, info, None)
+        
+    # 3. JPG/JPEG <= 700KB
+    if ext in (".jpg", ".jpeg") and size <= 700 * 1024:
+        info["reason"] = "jpg 且 <=700KB"
         return (orig_name, False, None, info, None)
 
-    # 规则 3: 动态质量
-    final_q = target_quality
-    if ext in (".jpg", ".jpeg"):
-        final_q = 95 if size <= 700 * 1024 else 90
+    # --- 以下为需要转换的规则 ---
+    
+    # 对于 JPG/JPEG 强制使用 90 质量，其他图片（如大 PNG）使用传入的默认质量
+    final_q = 90 if ext in (".jpg", ".jpeg") else default_quality
     info["quality"] = final_q
 
     try:
@@ -179,21 +190,28 @@ def compress_worker(args):
             im.load()
             info["width"], info["height"] = im.size
             info["mode"] = im.mode
+            
+            # 处理透明通道/色彩模式
             if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
                 im = im.convert("RGBA")
             else:
                 im = im.convert("RGB")
-            if max_size: im.thumbnail((max_size, max_size), Image.LANCZOS)
+                
+            if max_size: 
+                im.thumbnail((max_size, max_size), Image.LANCZOS)
 
+            # 用 cwebp 引擎，必须先转存为临时 png
             tmp_png = str(dst_path) + ".png"
             im.save(tmp_png, "PNG")
 
+        # 调用 cwebp：算力 -m 2，开启智能二次采样 -sharp_yuv
         cmd = ["cwebp", "-q", str(final_q), "-m", "2", "-sharp_yuv", tmp_png, "-o", str(dst_path)]
         subprocess.run(cmd, check=True, capture_output=True)
         os.unlink(tmp_png)
 
         new_size = dst_path.stat().st_size
         new_name = str(Path(orig_name).with_suffix(".webp"))
+        
         info.update({
             "new_name": new_name,
             "new_size": new_size,
@@ -208,7 +226,8 @@ def compress_worker(args):
         return (orig_name, False, str(e), info, None)
 
 # ==================== 原样保留 ZIP 结构与重打包 ====================
-def process_one_zip(zip_path: Path, out_root: Path, quality, max_size, convert_workers, compress_level):
+def process_one_zip(zip_path: Path, out_root: Path, default_quality, max_size, convert_workers, compress_level):
+    # 严格保留原压缩包名
     out_zip = out_root / zip_path.name
     tmp_dir = out_root / f"_{hashlib.md5(zip_path.name.encode()).hexdigest()[:8]}"
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -216,17 +235,19 @@ def process_one_zip(zip_path: Path, out_root: Path, quality, max_size, convert_w
     tasks, others = [], []
     print(f"[处理] {zip_path.name}", flush=True)
     t0 = time.time()
+    
     with zipfile.ZipFile(zip_path, 'r') as zin:
         for item in zin.infolist():
             if item.is_dir(): continue
             ext = Path(item.filename).suffix.lower()
             if ext in IMG_EXTS:
+                # 用哈希作临时文件名，防止原文件名包含非法字符或冲突，最后打包时还原
                 safe_name = hashlib.md5(item.filename.encode('utf-8')).hexdigest() + ext
                 src_temp = tmp_dir / safe_name
                 with zin.open(item) as f_in, open(src_temp, 'wb') as f_out:
                     shutil.copyfileobj(f_in, f_out)
                 dst_temp = tmp_dir / (safe_name + ".webp")
-                tasks.append((item.filename, src_temp, dst_temp, quality, max_size))
+                tasks.append((item.filename, src_temp, dst_temp, default_quality, max_size))
             else:
                 others.append(item)
 
@@ -239,15 +260,19 @@ def process_one_zip(zip_path: Path, out_root: Path, quality, max_size, convert_w
                     if converted and result_data:
                         results[orig_name] = result_data
                     else:
+                        # 未转换或失败，找回原图路径
                         src_temp = next(t[1] for t in tasks if t[0] == orig_name)
                         results[orig_name] = (orig_name, src_temp)
                     if info: image_stats.append(info)
 
+        # 重新打包：严格保留原始目录结构和文件名
         with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=compress_level) as zout:
             for item in others:
                 zout.writestr(item, zin.read(item))
+            
             for orig_name, (new_name, file_path) in results.items():
                 if orig_name != new_name:
+                    # 替换扩展名，保持路径不变
                     parts = list(Path(orig_name).parts)
                     parts[-1] = Path(new_name).name
                     arcname = str(Path(*parts))
@@ -263,6 +288,7 @@ def process_one_zip(zip_path: Path, out_root: Path, quality, max_size, convert_w
     failed = [s for s in image_stats if s.get("error")]
     orig_total = sum(s["orig_size"] for s in image_stats)
     new_total = sum(s["new_size"] for s in image_stats if s.get("converted")) + sum(s["orig_size"] for s in image_stats if not s.get("converted"))
+    
     stat = {
         "zip_name": zip_path.name,
         "url": None,
@@ -353,7 +379,6 @@ def html_escape(s):
             .replace('"', "&quot;").replace("'", "&#39;"))
 
 def write_summary(out_root: Path, stats, bundle_records, done_counter, errors, total_urls):
-    # ---- JSON ----
     json_path = out_root / "summary.json"
     payload = {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -366,7 +391,6 @@ def write_summary(out_root: Path, stats, bundle_records, done_counter, errors, t
     }
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # ---- 汇总计算 ----
     total_img = sum(s["image_count"] for s in stats)
     total_conv = sum(s["converted_count"] for s in stats)
     total_skip = sum(s["skipped_count"] for s in stats)
@@ -626,7 +650,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--urls", required=True)
     parser.add_argument("--output", default="output")
-    parser.add_argument("--quality", type=int, default=90)
+    parser.add_argument("--quality", type=int, default=90) # 修改为默认90
     parser.add_argument("--max-size", type=int, default=None)
     parser.add_argument("--compress-level", type=int, default=6)
     parser.add_argument("--download-workers", type=int, default=DEFAULT_DOWNLOAD_WORKERS)
