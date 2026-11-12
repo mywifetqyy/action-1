@@ -23,6 +23,10 @@ on:
         description: "下载器 auto / gallery-dl / requests"
         required: false
         default: "auto"
+      bundle_size_mb:
+        description: "每个独立包大小上限(MB),默认 1024=1GB"
+        required: false
+        default: "1024"
       release_tag:
         description: "Release tag 名(仅字母/数字/./-/_，不能有空格；留空自动 build-<run_number>)"
         required: false
@@ -76,7 +80,6 @@ jobs:
           pip install -r requirements.txt
           python -m gallery_dl --version
 
-      # 把输入里的空格/Tab/换行都当分隔符,每个链接一行
       - name: Write urls.txt
         env:
           INPUT_URLS: ${{ inputs.urls }}
@@ -93,6 +96,7 @@ jobs:
           MAX_SIZE: ${{ inputs.max_size || '' }}
           COMPRESS_LEVEL: ${{ inputs.compress_level || '1' }}
           DOWNLOADER: ${{ inputs.downloader || 'auto' }}
+          BUNDLE_SIZE_MB: ${{ inputs.bundle_size_mb || '1024' }}
           DOWNLOAD_HEADERS: ${{ secrets.DOWNLOAD_HEADERS }}
           DOWNLOAD_COOKIE: ${{ secrets.DOWNLOAD_COOKIE }}
           DOWNLOAD_USER_AGENT: ${{ secrets.DOWNLOAD_USER_AGENT }}
@@ -103,14 +107,14 @@ jobs:
                 --downloader "$DOWNLOADER"
                 --download-workers 3
                 --convert-workers 2
-                --min-request-interval 1.0)
+                --min-request-interval 1.0
+                --bundle-size-mb "$BUNDLE_SIZE_MB")
           if [ -n "$MAX_SIZE" ]; then ARGS+=(--max-size "$MAX_SIZE"); fi
           python scripts/process.py "${ARGS[@]}"
 
-      # 清理下载残留(下载失败的原始 zip 会留在 _downloads)
       - name: Cleanup downloads
         if: always()
-        run: rm -rf output/_downloads || true
+        run: rm -rf output/_downloads output/_bundles || true
 
       - name: Check output size
         run: |
@@ -126,7 +130,6 @@ jobs:
           path: output/*.zip
           if-no-files-found: error
 
-      # 解析并规范化 Release 元信息:tag 必须合法(无空格/非法字符),name/body 可自由填写。
       - name: Resolve release meta
         id: rel
         env:
