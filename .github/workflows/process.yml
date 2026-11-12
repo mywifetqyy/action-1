@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       urls:
-        description: "下载链接(每行一个,支持多个)"
+        description: "下载链接(每行一个,也支持空格分隔,支持多个)"
         required: true
         type: string
       quality:
@@ -76,14 +76,16 @@ jobs:
           pip install -r requirements.txt
           python -m gallery_dl --version
 
-      # 把手动输入的链接写到临时 urls.txt,供脚本读取。
+      # 把输入里的空格/Tab/换行都当分隔符,每个链接一行
       - name: Write urls.txt
         env:
           INPUT_URLS: ${{ inputs.urls }}
         run: |
-          printf '%s\n' "$INPUT_URLS" > urls.txt
+          printf '%s' "$INPUT_URLS" | tr -s '[:space:]' '\n' | sed '/^$/d' > urls.txt
           echo "=== urls.txt ==="
           cat urls.txt
+          echo "=== 行数 ==="
+          wc -l urls.txt
 
       - name: Run process
         env:
@@ -131,7 +133,6 @@ jobs:
           if [ -z "$TAG" ]; then
             TAG="build-${{ github.run_number }}"
           else
-            # 规范化为合法 git tag:空格->-，剔除非法字符，折叠连续 -，去首尾 -
             TAG=$(printf '%s' "$TAG" \
               | tr ' ' '-' \
               | sed -E 's/[~^:?*\[\\]//g; s/\.\.+/-/g; s/-+/-/g; s/^-+//; s/-+$//')
@@ -148,7 +149,6 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "使用 tag: $TAG"
           echo "使用 name: $NAME"
-          # body 可能多行,用文件传递更安全
           if [ -n "$IN_BODY" ]; then
             printf '%s\n' "$IN_BODY" > release_body.md
             echo "has_body=true" >> "$GITHUB_OUTPUT"
