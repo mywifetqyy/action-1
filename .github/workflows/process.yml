@@ -107,6 +107,11 @@ jobs:
           if [ -n "$MAX_SIZE" ]; then ARGS+=(--max-size "$MAX_SIZE"); fi
           python scripts/process.py "${ARGS[@]}"
 
+      # 清理下载残留(下载失败的原始 zip 会留在 _downloads)
+      - name: Cleanup downloads
+        if: always()
+        run: rm -rf output/_downloads || true
+
       - name: Check output size
         run: |
           du -sh output || true
