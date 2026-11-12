@@ -144,114 +144,77 @@ def download(url: str, dest: Path, timeout: int = 300, downloader: str = "auto",
 
 # ==================== 图片压缩核心逻辑 ====================
 def compress_worker(args):
-    """
-    独立进程，处理单张图片的压缩判断与执行
-    返回: (原文件名, 是否转换成功, 错误信息, 生成的临时文件路径 或 None)
-    """
     orig_name, src_path, dst_path, target_quality, max_size = args
     ext = Path(orig_name).suffix.lower()
     size = src_path.stat().st_size
 
-    # --- 规则 1 & 2: 不转换的情况 ---
-    if ext == ".webp":
-        return (orig_name, False, None, None)
-    if ext == ".png" and size <= 500 * 1024:
-        return (orig_name, False, None, None)
+    # 规则 1 & 2: 不转换
+    if ext == ".webp": return (orig_name, False, None, None)
+    if ext == ".png" and size <= 500 * 1024: return (orig_name, False, None, None)
 
-    # --- 规则 3: 动态质量 ---
+    # 规则 3: 动态质量
     final_q = target_quality
     if ext in (".jpg", ".jpeg"):
-        if size <= 700 * 1024:
-            final_q = 95
-        else:
-            final_q = 90
-    # 其余的大于 500KB 的 PNG 等，使用 target_quality（默认为 90）
+        final_q = 95 if size <= 700 * 1024 else 90
 
     try:
-        # 用 Pillow 处理尺寸缩放和模式转换
         with Image.open(src_path) as im:
             im.load()
             if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
                 im = im.convert("RGBA")
             else:
                 im = im.convert("RGB")
+            if max_size: im.thumbnail((max_size, max_size), Image.LANCZOS)
             
-            if max_size:
-                im.thumbnail((max_size, max_size), Image.LANCZOS)
-            
-            # 存临时 PNG 供 cwebp 处理
             tmp_png = str(dst_path) + ".png"
             im.save(tmp_png, "PNG")
 
-        # 调用 cwebp
-        cmd = [
-            "cwebp",
-            "-q", str(final_q),
-            "-m", "2",           # 规则 4：method=2
-            "-sharp_yuv",        # 开启智能二次采样
-            tmp_png,
-            "-o", str(dst_path)
-        ]
+        cmd = ["cwebp", "-q", str(final_q), "-m", "2", "-sharp_yuv", tmp_png, "-o", str(dst_path)]
         subprocess.run(cmd, check=True, capture_output=True)
         os.unlink(tmp_png)
 
-        # 替换原文件名后缀为 .webp
         new_name = str(Path(orig_name).with_suffix(".webp"))
         return (orig_name, True, None, (new_name, dst_path))
-
     except Exception as e:
-        # 如果转码失败，回退为原样保留
-        if os.path.exists(str(dst_path) + ".png"):
-            os.unlink(str(dst_path) + ".png")
+        if os.path.exists(str(dst_path) + ".png"): os.unlink(str(dst_path) + ".png")
         return (orig_name, False, str(e), None)
 
 # ==================== 原样保留 ZIP 结构与重打包 ====================
-def process_one_zip(zip_path: Path, out_root: Path, quality, max_size, convert_workers):
+def process_one_zip(zip_path: Path, out_root: Path, quality, max_size, convert_workers, compress_level):
     out_zip = out_root / zip_path.name
     tmp_dir = out_root / f"_{hashlib.md5(zip_path.name.encode()).hexdigest()[:8]}"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    tasks = []
-    others = []
-
+    tasks, others = [], []
     print(f"[处理] {zip_path.name}", flush=True)
-    # 1. 扫描 ZIP 内容
     with zipfile.ZipFile(zip_path, 'r') as zin:
         for item in zin.infolist():
             if item.is_dir(): continue
-            
             ext = Path(item.filename).suffix.lower()
             if ext in IMG_EXTS:
                 safe_name = hashlib.md5(item.filename.encode('utf-8')).hexdigest() + ext
                 src_temp = tmp_dir / safe_name
                 with zin.open(item) as f_in, open(src_temp, 'wb') as f_out:
                     shutil.copyfileobj(f_in, f_out)
-                
                 dst_temp = tmp_dir / (safe_name + ".webp")
                 tasks.append((item.filename, src_temp, dst_temp, quality, max_size))
             else:
                 others.append(item)
 
-        # 2. 启动多进程转换
         results = {}
         if tasks:
             with ProcessPoolExecutor(max_workers=convert_workers) as pool:
                 for orig_name, converted, err, result_data in pool.map(compress_worker, tasks):
-                    if err:
-                        print(f"  [转换失败] {orig_name}: {err}", file=sys.stderr)
+                    if err: print(f"  [转换失败] {orig_name}: {err}", file=sys.stderr)
                     if converted and result_data:
-                        new_name, webp_path = result_data
-                        results[orig_name] = (new_name, webp_path)
+                        results[orig_name] = result_data
                     else:
                         src_temp = next(t[1] for t in tasks if t[0] == orig_name)
                         results[orig_name] = (orig_name, src_temp)
 
-        # 3. 重新打包写入新 ZIP
-        with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zout:
+        with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=compress_level) as zout:
             for item in others:
-                data = zin.read(item)
-                zout.writestr(item, data)
-
+                zout.writestr(item, zin.read(item))
             for orig_name, (new_name, file_path) in results.items():
                 if orig_name != new_name:
                     parts = list(Path(orig_name).parts)
@@ -266,9 +229,10 @@ def process_one_zip(zip_path: Path, out_root: Path, quality, max_size, convert_w
 
 # ==================== 流式打包器 ====================
 class StreamingBundler:
-    def __init__(self, out_root: Path, max_bytes: int, keep_originals: bool = False):
+    def __init__(self, out_root: Path, max_bytes: int, compress_level: int = 1, keep_originals: bool = False):
         self.out_root = out_root
         self.max_bytes = max_bytes
+        self.compress_level = compress_level
         self.keep_originals = keep_originals
         self.queue = []
         self.current_size = 0
@@ -303,7 +267,7 @@ class StreamingBundler:
     def _make_bundle_locked(self, files):
         self.bundle_index += 1
         bundle_path = self.out_root / f"bundle-{self.bundle_index:02d}.zip"
-        with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+        with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED, compresslevel=self.compress_level) as zf:
             for f in files: zf.write(f, f.name)
         total = sum(f.stat().st_size for f in files)
         print(f"[打包] {bundle_path.name}: {len(files)} 个文件, 原始 {total/1024**2:.1f} MB -> 压缩后 {bundle_path.stat().st_size/1024**2:.1f} MB", flush=True)
@@ -329,8 +293,7 @@ def run_pipeline(urls, downloads_dir: Path, out_root: Path, bundler: StreamingBu
             future_map = {pool.submit(download, url, downloads_dir / name, downloader=args.downloader, min_interval=args.min_request_interval): url for url, name in tasks}
             for fut in as_completed(future_map):
                 url = future_map[fut]
-                try:
-                    q.put((url, fut.result()))
+                try: q.put((url, fut.result()))
                 except Exception as e:
                     with results_lock:
                         errors.append((url, str(e)))
@@ -346,7 +309,7 @@ def run_pipeline(urls, downloads_dir: Path, out_root: Path, bundler: StreamingBu
                 return
             url, zip_path = item
             try:
-                out_zip = process_one_zip(zip_path, out_root, args.quality, args.max_size, args.convert_workers)
+                out_zip = process_one_zip(zip_path, out_root, args.quality, args.max_size, args.convert_workers, args.compress_level)
                 zip_path.unlink(missing_ok=True)
                 bundler.add(out_zip)
                 with results_lock:
@@ -371,9 +334,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--urls", required=True)
     parser.add_argument("--output", default="output")
-    # 这里默认值改为了 90
     parser.add_argument("--quality", type=int, default=90)
     parser.add_argument("--max-size", type=int, default=None)
+    parser.add_argument("--compress-level", type=int, default=6)  # 补上这个参数
     parser.add_argument("--download-workers", type=int, default=DEFAULT_DOWNLOAD_WORKERS)
     parser.add_argument("--convert-workers", type=int, default=max(1, os.cpu_count() or 2))
     parser.add_argument("--downloader", default="auto")
@@ -390,7 +353,7 @@ def main():
     downloads = out_root / "_downloads"
     downloads.mkdir(parents=True, exist_ok=True)
 
-    bundler = StreamingBundler(out_root, args.bundle_size_mb * 1024**2, args.keep_originals)
+    bundler = StreamingBundler(out_root, args.bundle_size_mb * 1024**2, args.compress_level, args.keep_originals)
     done_counter, errors = run_pipeline(urls, downloads, out_root, bundler, args)
     bundles = bundler.finish()
 
