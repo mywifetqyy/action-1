@@ -24,12 +24,12 @@ on:
         required: false
         default: "auto"
       release_tag:
-        description: "Release tag 名(留空自动用 build-<run_number>)"
+        description: "Release tag 名(仅字母/数字/./-/_，不能有空格；留空自动 build-<run_number>)"
         required: false
         type: string
         default: ""
       release_name:
-        description: "Release 标题(留空自动用 tag 名)"
+        description: "Release 标题(可含空格，留空用 tag 名)"
         required: false
         type: string
         default: ""
@@ -76,6 +76,7 @@ jobs:
           pip install -r requirements.txt
           python -m gallery_dl --version
 
+      # 把手动输入的链接写到临时 urls.txt,供脚本读取。
       - name: Write urls.txt
         env:
           INPUT_URLS: ${{ inputs.urls }}
@@ -118,7 +119,7 @@ jobs:
           path: output/*.zip
           if-no-files-found: error
 
-      # 解析 Release 元信息:留空则回退到默认值
+      # 解析并规范化 Release 元信息:tag 必须合法(无空格/非法字符),name/body 可自由填写。
       - name: Resolve release meta
         id: rel
         env:
@@ -127,13 +128,26 @@ jobs:
           IN_BODY: ${{ inputs.release_body }}
         run: |
           TAG="$IN_TAG"
-          if [ -z "$TAG" ]; then TAG="build-${{ github.run_number }}"; fi
+          if [ -z "$TAG" ]; then
+            TAG="build-${{ github.run_number }}"
+          else
+            # 规范化为合法 git tag:空格->-，剔除非法字符，折叠连续 -，去首尾 -
+            TAG=$(printf '%s' "$TAG" \
+              | tr ' ' '-' \
+              | sed -E 's/[~^:?*\[\\]//g; s/\.\.+/-/g; s/-+/-/g; s/^-+//; s/-+$//')
+            if [ -z "$TAG" ]; then
+              echo "::error::release_tag 规范化后为空,请填写合法 tag(字母/数字/.-_)"
+              exit 1
+            fi
+          fi
           NAME="$IN_NAME"
           if [ -z "$NAME" ]; then NAME="$TAG"; fi
           {
             echo "tag=$TAG"
             echo "name=$NAME"
           } >> "$GITHUB_OUTPUT"
+          echo "使用 tag: $TAG"
+          echo "使用 name: $NAME"
           # body 可能多行,用文件传递更安全
           if [ -n "$IN_BODY" ]; then
             printf '%s\n' "$IN_BODY" > release_body.md
