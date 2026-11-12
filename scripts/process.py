@@ -10,6 +10,7 @@ import subprocess
 import threading
 import multiprocessing as mp
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
 import requests
@@ -239,7 +240,12 @@ def make_tasks(urls, downloads_dir: Path):
     tasks = []
     used = set()
     for i, url in enumerate(urls, 1):
-        name = url.split("?")[0].rstrip("/").split("/")[-1] or f"archive_{i}.zip"
+        # 取路径部分(不含查询串),再取最后一段并完全解码
+        path_part = urlsplit(url).path.rstrip("/")
+        raw_name = path_part.split("/")[-1] if path_part else ""
+        name = unquote(raw_name) or f"archive_{i}.zip"
+        # 解码后可能含路径分隔符或非法字符,只取 basename 兜底
+        name = Path(name).name
         if not name.lower().endswith(".zip"):
             name = f"archive_{i}.zip"
         stem, seq = name[:-4], 2
@@ -252,10 +258,7 @@ def make_tasks(urls, downloads_dir: Path):
 
 
 def run_pipeline(urls, downloads: Path, out_root: Path, args):
-    """边下边处理:每下完一个包立刻处理,处理完按需删原包。
-
-    峰值从「全部原始包 + 当前解压包」降到「在途包 + 当前解压包」。
-    """
+    """边下边处理:每下完一个包立刻处理,处理完按需删原包。"""
     tasks = make_tasks(urls, downloads)
     ok = fail = 0
     with ThreadPoolExecutor(max_workers=args.download_workers) as pool:
@@ -302,7 +305,7 @@ def main():
     parser.add_argument("--compress-level", type=int, default=6)
     parser.add_argument("--download-workers", type=int, default=DEFAULT_DOWNLOAD_WORKERS)
     parser.add_argument("--convert-workers", type=int,
-                        default=min(2, os.cpu_count() or 2))   # 限核,避免打满 CPU
+                        default=min(2, os.cpu_count() or 2))
     parser.add_argument("--downloader", choices=["auto", "gallery-dl", "requests"],
                         default="auto")
     parser.add_argument("--download-timeout", type=int, default=DEFAULT_DOWNLOAD_TIMEOUT)
