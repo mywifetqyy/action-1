@@ -28,12 +28,12 @@ on:
         required: false
         default: "1024"
       release_tag:
-        description: "Release tag 名(仅字母/数字/./-/_，不能有空格；留空自动 build-<run_number>)"
+        description: "Release tag 名(留空自动 build-<run_number>)"
         required: false
         type: string
         default: ""
       release_name:
-        description: "Release 标题(可含空格，留空用 tag 名)"
+        description: "Release 标题(留空用 tag 名)"
         required: false
         type: string
         default: ""
@@ -59,7 +59,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     concurrency:
       group: batch-zip-webp
       cancel-in-progress: false
@@ -78,6 +78,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          # 安装 cwebp 工具集
+          sudo apt-get update && sudo apt-get install -y webp
+          cwebp -version
           python -m gallery_dl --version
 
       - name: Write urls.txt
@@ -105,7 +108,7 @@ jobs:
                 --quality "$QUALITY"
                 --compress-level "$COMPRESS_LEVEL"
                 --downloader "$DOWNLOADER"
-                --download-workers 3
+                --download-workers 5
                 --convert-workers 2
                 --min-request-interval 1.0
                 --bundle-size-mb "$BUNDLE_SIZE_MB")
@@ -114,9 +117,10 @@ jobs:
 
       - name: Cleanup downloads
         if: always()
-        run: rm -rf output/_downloads output/_bundles || true
+        run: rm -rf output/_downloads || true
 
       - name: Check output size
+        if: always()
         run: |
           du -sh output || true
           find output -name '*.zip' -size +1900M -print | while read f; do
@@ -124,14 +128,18 @@ jobs:
           done
 
       - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: webp-zips
-          path: output/*.zip
-          if-no-files-found: error
+          path: |
+            output/*.zip
+            output/summary.txt
+          if-no-files-found: warn
 
       - name: Resolve release meta
         id: rel
+        if: always()
         env:
           IN_TAG: ${{ inputs.release_tag }}
           IN_NAME: ${{ inputs.release_name }}
@@ -145,18 +153,13 @@ jobs:
               | tr ' ' '-' \
               | sed -E 's/[~^:?*\[\\]//g; s/\.\.+/-/g; s/-+/-/g; s/^-+//; s/-+$//')
             if [ -z "$TAG" ]; then
-              echo "::error::release_tag 规范化后为空,请填写合法 tag(字母/数字/.-_)"
+              echo "::error::release_tag 规范化后为空"
               exit 1
             fi
           fi
           NAME="$IN_NAME"
           if [ -z "$NAME" ]; then NAME="$TAG"; fi
-          {
-            echo "tag=$TAG"
-            echo "name=$NAME"
-          } >> "$GITHUB_OUTPUT"
-          echo "使用 tag: $TAG"
-          echo "使用 name: $NAME"
+          { echo "tag=$TAG"; echo "name=$NAME"; } >> "$GITHUB_OUTPUT"
           if [ -n "$IN_BODY" ]; then
             printf '%s\n' "$IN_BODY" > release_body.md
             echo "has_body=true" >> "$GITHUB_OUTPUT"
@@ -165,6 +168,9 @@ jobs:
           fi
 
       - name: Create Release
+        id: release
+        if: always() && hashFiles('output/*.zip') != ''
+        continue-on-error: true
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.rel.outputs.tag }}
@@ -174,4 +180,16 @@ jobs:
           draft: ${{ inputs.release_draft }}
           prerelease: ${{ inputs.release_prerelease }}
           files: output/*.zip
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: false
+
+      - name: Retry failed uploads
+        if: always() && steps.release.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: |
+          echo "Release 上传部分失败,尝试逐个重传..."
+          for f in output/*.zip; do
+            [ -f "$f" ] || continue
+            gh release upload "$TAG" "$f" --clobber || true
+          done
