@@ -23,7 +23,7 @@ from PIL import Image
 # 支持的图片扩展名
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".webp"}
 DEFAULT_DOWNLOAD_WORKERS = 5
-DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+DEFAULT_UA = "970656489@qq.com"
 FALLBACK_UAS = [
     DEFAULT_UA,
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",

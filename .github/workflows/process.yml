@@ -123,7 +123,7 @@ jobs:
         if: always()
         run: |
           du -sh output || true
-          find output -name '*.zip' -size +1900M -print | while read f; do
+          find output -name 'bundle-*.zip' -size +1900M -print | while read f; do
             echo "::warning file=$f::超过 1.9GB,Release 可能失败"
           done
 
@@ -169,7 +169,7 @@ jobs:
 
       - name: Create Release
         id: release
-        if: always() && hashFiles('output/*.zip') != ''
+        if: always() && hashFiles('output/bundle-*.zip') != ''
         continue-on-error: true
         uses: softprops/action-gh-release@v2
         with:
@@ -179,7 +179,7 @@ jobs:
           generate_release_notes: ${{ steps.rel.outputs.has_body != 'true' }}
           draft: ${{ inputs.release_draft }}
           prerelease: ${{ inputs.release_prerelease }}
-          files: output/*.zip
+          files: output/bundle-*.zip
           fail_on_unmatched_files: false
 
       - name: Retry failed uploads
@@ -189,7 +189,7 @@ jobs:
           TAG: ${{ steps.rel.outputs.tag }}
         run: |
           echo "Release 上传部分失败,尝试逐个重传..."
-          for f in output/*.zip; do
+          for f in output/bundle-*.zip; do
             [ -f "$f" ] || continue
             gh release upload "$TAG" "$f" --clobber || true
           done
