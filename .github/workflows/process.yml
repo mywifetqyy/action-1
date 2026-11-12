@@ -133,8 +133,9 @@ jobs:
         with:
           name: webp-zips
           path: |
-            output/*.zip
-            output/summary.txt
+            output/bundle-*.zip
+            output/summary.html
+            output/summary.json
           if-no-files-found: warn
 
       - name: Resolve release meta
@@ -179,7 +180,10 @@ jobs:
           generate_release_notes: ${{ steps.rel.outputs.has_body != 'true' }}
           draft: ${{ inputs.release_draft }}
           prerelease: ${{ inputs.release_prerelease }}
-          files: output/bundle-*.zip
+          files: |
+            output/bundle-*.zip
+            output/summary.html
+            output/summary.json
           fail_on_unmatched_files: false
 
       - name: Retry failed uploads
@@ -189,7 +193,7 @@ jobs:
           TAG: ${{ steps.rel.outputs.tag }}
         run: |
           echo "Release 上传部分失败,尝试逐个重传..."
-          for f in output/bundle-*.zip; do
+          for f in output/bundle-*.zip output/summary.html output/summary.json; do
             [ -f "$f" ] || continue
             gh release upload "$TAG" "$f" --clobber || true
           done

@@ -16,6 +16,7 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 from queue import Queue
 from concurrent.futures import ProcessPoolExecutor
+from datetime import datetime
 
 import requests
 from PIL import Image
@@ -147,25 +148,43 @@ def compress_worker(args):
     orig_name, src_path, dst_path, target_quality, max_size = args
     ext = Path(orig_name).suffix.lower()
     size = src_path.stat().st_size
+    info = {
+        "orig_name": orig_name,
+        "ext": ext,
+        "orig_size": size,
+        "new_name": orig_name,
+        "new_size": size,
+        "converted": False,
+        "quality": None,
+        "reason": None,
+        "error": None,
+    }
 
     # 规则 1 & 2: 不转换
-    if ext == ".webp": return (orig_name, False, None, None)
-    if ext == ".png" and size <= 500 * 1024: return (orig_name, False, None, None)
+    if ext == ".webp":
+        info["reason"] = "已是 webp"
+        return (orig_name, False, None, info, None)
+    if ext == ".png" and size <= 500 * 1024:
+        info["reason"] = "png 且 <=500KB"
+        return (orig_name, False, None, info, None)
 
     # 规则 3: 动态质量
     final_q = target_quality
     if ext in (".jpg", ".jpeg"):
         final_q = 95 if size <= 700 * 1024 else 90
+    info["quality"] = final_q
 
     try:
         with Image.open(src_path) as im:
             im.load()
+            info["width"], info["height"] = im.size
+            info["mode"] = im.mode
             if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
                 im = im.convert("RGBA")
             else:
                 im = im.convert("RGB")
             if max_size: im.thumbnail((max_size, max_size), Image.LANCZOS)
-            
+
             tmp_png = str(dst_path) + ".png"
             im.save(tmp_png, "PNG")
 
@@ -173,11 +192,20 @@ def compress_worker(args):
         subprocess.run(cmd, check=True, capture_output=True)
         os.unlink(tmp_png)
 
+        new_size = dst_path.stat().st_size
         new_name = str(Path(orig_name).with_suffix(".webp"))
-        return (orig_name, True, None, (new_name, dst_path))
+        info.update({
+            "new_name": new_name,
+            "new_size": new_size,
+            "converted": True,
+            "saved": size - new_size,
+            "saved_pct": round((size - new_size) / size * 100, 2) if size else 0.0,
+        })
+        return (orig_name, True, None, info, (new_name, dst_path))
     except Exception as e:
         if os.path.exists(str(dst_path) + ".png"): os.unlink(str(dst_path) + ".png")
-        return (orig_name, False, str(e), None)
+        info["error"] = str(e)
+        return (orig_name, False, str(e), info, None)
 
 # ==================== 原样保留 ZIP 结构与重打包 ====================
 def process_one_zip(zip_path: Path, out_root: Path, quality, max_size, convert_workers, compress_level):
@@ -187,6 +215,7 @@ def process_one_zip(zip_path: Path, out_root: Path, quality, max_size, convert_w
 
     tasks, others = [], []
     print(f"[处理] {zip_path.name}", flush=True)
+    t0 = time.time()
     with zipfile.ZipFile(zip_path, 'r') as zin:
         for item in zin.infolist():
             if item.is_dir(): continue
@@ -202,15 +231,17 @@ def process_one_zip(zip_path: Path, out_root: Path, quality, max_size, convert_w
                 others.append(item)
 
         results = {}
+        image_stats = []
         if tasks:
             with ProcessPoolExecutor(max_workers=convert_workers) as pool:
-                for orig_name, converted, err, result_data in pool.map(compress_worker, tasks):
+                for orig_name, converted, err, info, result_data in pool.map(compress_worker, tasks):
                     if err: print(f"  [转换失败] {orig_name}: {err}", file=sys.stderr)
                     if converted and result_data:
                         results[orig_name] = result_data
                     else:
                         src_temp = next(t[1] for t in tasks if t[0] == orig_name)
                         results[orig_name] = (orig_name, src_temp)
+                    if info: image_stats.append(info)
 
         with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=compress_level) as zout:
             for item in others:
@@ -225,7 +256,31 @@ def process_one_zip(zip_path: Path, out_root: Path, quality, max_size, convert_w
                 zout.write(file_path, arcname)
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
-    return out_zip
+
+    elapsed = round(time.time() - t0, 2)
+    converted = [s for s in image_stats if s.get("converted")]
+    skipped = [s for s in image_stats if not s.get("converted") and not s.get("error")]
+    failed = [s for s in image_stats if s.get("error")]
+    orig_total = sum(s["orig_size"] for s in image_stats)
+    new_total = sum(s["new_size"] for s in image_stats if s.get("converted")) + sum(s["orig_size"] for s in image_stats if not s.get("converted"))
+    stat = {
+        "zip_name": zip_path.name,
+        "url": None,
+        "src_zip_size": zip_path.stat().st_size,
+        "out_zip_size": out_zip.stat().st_size,
+        "image_count": len(image_stats),
+        "other_count": len(others),
+        "converted_count": len(converted),
+        "skipped_count": len(skipped),
+        "failed_count": len(failed),
+        "image_orig_bytes": orig_total,
+        "image_new_bytes": new_total,
+        "image_saved_bytes": orig_total - new_total,
+        "image_saved_pct": round((orig_total - new_total) / orig_total * 100, 2) if orig_total else 0.0,
+        "elapsed_sec": elapsed,
+        "images": image_stats,
+    }
+    return out_zip, stat
 
 # ==================== 流式打包器 ====================
 class StreamingBundler:
@@ -239,6 +294,7 @@ class StreamingBundler:
         self.bundle_index = 0
         self.bundles = []
         self.lock = threading.Lock()
+        self.bundle_records = []
 
     def add(self, zip_path: Path):
         if not zip_path.exists(): return
@@ -272,15 +328,249 @@ class StreamingBundler:
         total = sum(f.stat().st_size for f in files)
         print(f"[打包] {bundle_path.name}: {len(files)} 个文件, 原始 {total/1024**2:.1f} MB -> 压缩后 {bundle_path.stat().st_size/1024**2:.1f} MB", flush=True)
         self.bundles.append(bundle_path)
+        self.bundle_records.append({
+            "bundle": bundle_path.name,
+            "files": [f.name for f in files],
+            "files_count": len(files),
+            "src_bytes": total,
+            "out_bytes": bundle_path.stat().st_size,
+        })
 
     def finish(self):
         with self.lock: self._flush_locked()
         return self.bundles
 
+# ==================== 统计输出 ====================
+def fmt_bytes(n):
+    if n is None: return "-"
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(n) < 1024 or unit == "GB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
+
+def html_escape(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;").replace("'", "&#39;"))
+
+def write_summary(out_root: Path, stats, bundle_records, done_counter, errors, total_urls):
+    # ---- JSON ----
+    json_path = out_root / "summary.json"
+    payload = {
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "total_urls": total_urls,
+        "success": done_counter["done"],
+        "failed": done_counter["failed"],
+        "errors": errors,
+        "bundles": bundle_records,
+        "zips": stats,
+    }
+    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # ---- 汇总计算 ----
+    total_img = sum(s["image_count"] for s in stats)
+    total_conv = sum(s["converted_count"] for s in stats)
+    total_skip = sum(s["skipped_count"] for s in stats)
+    total_fail = sum(s["failed_count"] for s in stats)
+    total_orig = sum(s["image_orig_bytes"] for s in stats)
+    total_new = sum(s["image_new_bytes"] for s in stats)
+    saved = total_orig - total_new
+    saved_pct = (saved / total_orig * 100) if total_orig else 0.0
+    total_src_zip = sum(s["src_zip_size"] for s in stats)
+    total_out_zip = sum(s["out_zip_size"] for s in stats)
+    total_elapsed = sum(s["elapsed_sec"] for s in stats)
+
+    def pct_bar(p):
+        p = max(0.0, min(100.0, p))
+        return (
+            f'<div class="bar"><div class="bar-fill" style="width:{p:.1f}%"></div>'
+            f'<span class="bar-label">{p:.1f}%</span></div>'
+        )
+
+    zip_rows = []
+    for i, s in enumerate(stats, 1):
+        zip_rows.append(f"""
+        <tr>
+          <td class="num">{i}</td>
+          <td class="name" title="{html_escape(s['zip_name'])}">{html_escape(s['zip_name'])}</td>
+          <td class="num">{s['image_count']}</td>
+          <td class="num ok">{s['converted_count']}</td>
+          <td class="num muted">{s['skipped_count']}</td>
+          <td class="num {'err' if s['failed_count'] else ''}">{s['failed_count']}</td>
+          <td class="num">{fmt_bytes(s['image_orig_bytes'])}</td>
+          <td class="num">{fmt_bytes(s['image_new_bytes'])}</td>
+          <td class="num">{s['image_saved_pct']:.1f}%</td>
+          <td class="num">{s['elapsed_sec']:.1f}s</td>
+        </tr>""")
+
+    detail_blocks = []
+    for i, s in enumerate(stats, 1):
+        rows = []
+        for img in s["images"]:
+            if img.get("converted"):
+                status, cls = "转换", "ok"
+                note = f"节省 {img.get('saved_pct', 0)}%"
+            elif img.get("error"):
+                status, cls = "失败", "err"
+                note = html_escape(img.get("error") or "")
+            else:
+                status, cls = "跳过", "muted"
+                note = html_escape(img.get("reason") or "")
+            rows.append(f"""
+            <tr>
+              <td class="name" title="{html_escape(img['orig_name'])}">{html_escape(img['orig_name'])}</td>
+              <td>{html_escape(img.get('ext',''))}</td>
+              <td class="num">{fmt_bytes(img.get('orig_size'))}</td>
+              <td class="num">{fmt_bytes(img.get('new_size'))}</td>
+              <td class="num">{img.get('quality') or '-'}</td>
+              <td class="{cls}">{status}</td>
+              <td class="note">{note}</td>
+            </tr>""")
+        url_line = f'<div class="url">{html_escape(s["url"])}</div>' if s.get("url") else ""
+        detail_blocks.append(f"""
+        <details class="zip-detail">
+          <summary>
+            <span class="idx">[{i}]</span>
+            <span class="name">{html_escape(s['zip_name'])}</span>
+            <span class="badge">{s['image_count']} 图</span>
+            <span class="badge ok">{s['converted_count']} 转换</span>
+            <span class="badge muted">{s['skipped_count']} 跳过</span>
+            <span class="badge {'err' if s['failed_count'] else 'muted'}">{s['failed_count']} 失败</span>
+            <span class="badge">{fmt_bytes(s['src_zip_size'])} → {fmt_bytes(s['out_zip_size'])}</span>
+          </summary>
+          {url_line}
+          <table class="tbl images">
+            <thead><tr>
+              <th>原文件</th><th>扩展名</th><th>原始</th><th>处理后</th><th>质量</th><th>状态</th><th>说明</th>
+            </tr></thead>
+            <tbody>{''.join(rows)}</tbody>
+          </table>
+        </details>""")
+
+    bundle_rows = []
+    for b in bundle_records:
+        bundle_rows.append(f"""
+        <tr>
+          <td class="name">{html_escape(b['bundle'])}</td>
+          <td class="num">{b['files_count']}</td>
+          <td class="num">{fmt_bytes(b['src_bytes'])}</td>
+          <td class="num">{fmt_bytes(b['out_bytes'])}</td>
+        </tr>""")
+
+    error_rows = []
+    for url, err in errors:
+        error_rows.append(f"""
+        <tr>
+          <td class="name" title="{html_escape(url)}">{html_escape(url)}</td>
+          <td class="err">{html_escape(err)}</td>
+        </tr>""")
+
+    html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Batch Zip → WebP 统计报告</title>
+<style>
+  :root {{
+    --bg:#0f1419; --panel:#161b22; --panel2:#1c232b; --border:#2d333b;
+    --fg:#e6edf3; --muted:#8b949e; --ok:#3fb950; --err:#f85149; --accent:#58a6ff;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin:0; padding:24px; background:var(--bg); color:var(--fg);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans CJK SC","Microsoft YaHei",sans-serif;
+  }}
+  h1 {{ font-size:22px; margin:0 0 4px; }}
+  h2 {{ font-size:16px; margin:28px 0 10px; color:var(--accent); border-left:3px solid var(--accent); padding-left:8px; }}
+  .sub {{ color:var(--muted); font-size:13px; margin-bottom:20px; }}
+  .cards {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; }}
+  .card {{ background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:14px 16px; }}
+  .card .label {{ color:var(--muted); font-size:12px; margin-bottom:6px; }}
+  .card .value {{ font-size:20px; font-weight:600; }}
+  .card .value.ok {{ color:var(--ok); }}
+  .card .value.err {{ color:var(--err); }}
+  .card .hint {{ color:var(--muted); font-size:12px; margin-top:4px; }}
+  .tbl {{ width:100%; border-collapse:collapse; background:var(--panel); border:1px solid var(--border); border-radius:8px; overflow:hidden; }}
+  .tbl th, .tbl td {{ padding:8px 10px; text-align:left; border-bottom:1px solid var(--border); }}
+  .tbl th {{ background:var(--panel2); color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.03em; }}
+  .tbl tr:last-child td {{ border-bottom:none; }}
+  .tbl tbody tr:hover {{ background:var(--panel2); }}
+  .num {{ text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }}
+  .name {{ max-width:420px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+  .note {{ color:var(--muted); font-size:12px; }}
+  .ok {{ color:var(--ok); }} .err {{ color:var(--err); }} .muted {{ color:var(--muted); }}
+  .bar {{ position:relative; height:18px; background:var(--panel2); border-radius:4px; overflow:hidden; min-width:120px; }}
+  .bar-fill {{ height:100%; background:linear-gradient(90deg,#238636,#3fb950); }}
+  .bar-label {{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:11px; font-variant-numeric:tabular-nums; }}
+  details.zip-detail {{ background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-bottom:10px; }}
+  details.zip-detail > summary {{ cursor:pointer; padding:10px 14px; display:flex; align-items:center; gap:10px; flex-wrap:wrap; list-style:none; }}
+  details.zip-detail > summary::-webkit-details-marker {{ display:none; }}
+  details.zip-detail[open] > summary {{ border-bottom:1px solid var(--border); }}
+  details.zip-detail .url {{ padding:8px 14px; color:var(--muted); font-size:12px; word-break:break-all; }}
+  details.zip-detail table {{ border:none; border-radius:0; }}
+  .idx {{ color:var(--muted); font-variant-numeric:tabular-nums; }}
+  .badge {{ font-size:11px; padding:2px 8px; border-radius:999px; background:var(--panel2); border:1px solid var(--border); color:var(--muted); white-space:nowrap; }}
+  .badge.ok {{ color:var(--ok); border-color:#238636; }}
+  .badge.err {{ color:var(--err); border-color:#8e1519; }}
+  .empty {{ color:var(--muted); padding:14px; background:var(--panel); border:1px dashed var(--border); border-radius:8px; }}
+  footer {{ margin-top:32px; color:var(--muted); font-size:12px; text-align:center; }}
+</style>
+</head>
+<body>
+  <h1>Batch Zip → WebP 统计报告</h1>
+  <div class="sub">生成时间：{html_escape(payload['generated_at'])} ｜ URL 总数 {total_urls} ｜ 成功 {done_counter['done']} ｜ 失败 {done_counter['failed']}</div>
+
+  <h2>总览</h2>
+  <div class="cards">
+    <div class="card"><div class="label">ZIP 文件数</div><div class="value">{len(stats)}</div></div>
+    <div class="card"><div class="label">ZIP 原始总大小</div><div class="value">{fmt_bytes(total_src_zip)}</div></div>
+    <div class="card"><div class="label">ZIP 处理后总大小</div><div class="value">{fmt_bytes(total_out_zip)}</div></div>
+    <div class="card"><div class="label">图片总数</div><div class="value">{total_img}</div>
+      <div class="hint">转换 {total_conv} ｜ 跳过 {total_skip} ｜ 失败 <span class="{'err' if total_fail else 'muted'}">{total_fail}</span></div></div>
+    <div class="card"><div class="label">图片原始总大小</div><div class="value">{fmt_bytes(total_orig)}</div></div>
+    <div class="card"><div class="label">图片处理后总大小</div><div class="value">{fmt_bytes(total_new)}</div></div>
+    <div class="card"><div class="label">节省空间</div><div class="value ok">{fmt_bytes(saved)}</div>
+      <div class="hint">{saved_pct:.2f}%</div></div>
+    <div class="card"><div class="label">处理总耗时</div><div class="value">{total_elapsed:.2f}s</div></div>
+  </div>
+
+  <h2>节省比例</h2>
+  {pct_bar(saved_pct)}
+
+  <h2>各 ZIP 汇总</h2>
+  <table class="tbl">
+    <thead><tr>
+      <th>#</th><th>ZIP 文件名</th><th>图片</th><th>转换</th><th>跳过</th><th>失败</th>
+      <th>原始</th><th>处理后</th><th>节省</th><th>耗时</th>
+    </tr></thead>
+    <tbody>{''.join(zip_rows) if zip_rows else '<tr><td colspan="10" class="empty">无数据</td></tr>'}</tbody>
+  </table>
+
+  <h2>图片明细（点击展开）</h2>
+  {''.join(detail_blocks) if detail_blocks else '<div class="empty">无数据</div>'}
+
+  <h2>打包结果</h2>
+  <table class="tbl">
+    <thead><tr><th>Bundle</th><th>文件数</th><th>原始大小</th><th>打包后</th></tr></thead>
+    <tbody>{''.join(bundle_rows) if bundle_rows else '<tr><td colspan="4" class="empty">无数据</td></tr>'}</tbody>
+  </table>
+
+  <h2>错误列表</h2>
+  <table class="tbl">
+    <thead><tr><th>URL</th><th>错误</th></tr></thead>
+    <tbody>{''.join(error_rows) if error_rows else '<tr><td colspan="2" class="empty">无错误</td></tr>'}</tbody>
+  </table>
+
+  <footer>Batch Zip → WebP · 自动生成</footer>
+</body>
+</html>"""
+    (out_root / "summary.html").write_text(html, encoding="utf-8")
+
 # ==================== 流水线 ====================
 def run_pipeline(urls, downloads_dir: Path, out_root: Path, bundler: StreamingBundler, args):
     q = Queue(maxsize=max(2, args.download_workers))
     errors = []
+    stats = []
     results_lock = threading.Lock()
     done_counter = {"done": 0, "failed": 0}
     total = len(urls)
@@ -309,10 +599,12 @@ def run_pipeline(urls, downloads_dir: Path, out_root: Path, bundler: StreamingBu
                 return
             url, zip_path = item
             try:
-                out_zip = process_one_zip(zip_path, out_root, args.quality, args.max_size, args.convert_workers, args.compress_level)
+                out_zip, stat = process_one_zip(zip_path, out_root, args.quality, args.max_size, args.convert_workers, args.compress_level)
+                stat["url"] = url
                 zip_path.unlink(missing_ok=True)
                 bundler.add(out_zip)
                 with results_lock:
+                    stats.append(stat)
                     done_counter["done"] += 1
                     print(f"[进度] {done_counter['done'] + done_counter['failed']}/{total} 完成, 已打 {bundler.bundle_index} 个 bundle", flush=True)
             except Exception as e:
@@ -327,7 +619,7 @@ def run_pipeline(urls, downloads_dir: Path, out_root: Path, bundler: StreamingBu
     for c in consumers: c.start()
     p.join()
     for c in consumers: c.join()
-    return done_counter, errors
+    return done_counter, errors, stats
 
 # ==================== 主流程 ====================
 def main():
@@ -336,7 +628,7 @@ def main():
     parser.add_argument("--output", default="output")
     parser.add_argument("--quality", type=int, default=90)
     parser.add_argument("--max-size", type=int, default=None)
-    parser.add_argument("--compress-level", type=int, default=6)  # 补上这个参数
+    parser.add_argument("--compress-level", type=int, default=6)
     parser.add_argument("--download-workers", type=int, default=DEFAULT_DOWNLOAD_WORKERS)
     parser.add_argument("--convert-workers", type=int, default=max(1, os.cpu_count() or 2))
     parser.add_argument("--downloader", default="auto")
@@ -354,11 +646,13 @@ def main():
     downloads.mkdir(parents=True, exist_ok=True)
 
     bundler = StreamingBundler(out_root, args.bundle_size_mb * 1024**2, args.compress_level, args.keep_originals)
-    done_counter, errors = run_pipeline(urls, downloads, out_root, bundler, args)
+    done_counter, errors, stats = run_pipeline(urls, downloads, out_root, bundler, args)
     bundles = bundler.finish()
 
     if not args.keep_originals and downloads.exists() and not any(downloads.iterdir()):
         shutil.rmtree(downloads, ignore_errors=True)
+
+    write_summary(out_root, stats, bundler.bundle_records, done_counter, errors, len(urls))
 
     print(f"\n[全部完成] 成功 {done_counter['done']}, 失败 {done_counter['failed']}, 独立包 {len(bundles)} 个", flush=True)
     if done_counter["done"] == 0 and done_counter["failed"] > 0: sys.exit(1)
