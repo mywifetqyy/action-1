@@ -78,10 +78,28 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          # 安装 cwebp 工具集
-          sudo apt-get update && sudo apt-get install -y webp
+          # 图片压缩工具 + 归档解包工具（rar/7z 必需 p7zip-full）
+          sudo apt-get update
+          sudo apt-get install -y webp p7zip-full
+          echo "=== cwebp ==="
           cwebp -version
+          echo "=== 7z ==="
+          7z | head -n 3 || true
+          echo "=== gallery-dl ==="
           python -m gallery_dl --version
+
+      - name: Preflight check
+        run: |
+          set -e
+          command -v cwebp >/dev/null || { echo "::error::缺少 cwebp"; exit 1; }
+          command -v 7z    >/dev/null || { echo "::error::缺少 7z (p7zip-full)"; exit 1; }
+          command -v python >/dev/null || { echo "::error::缺少 python"; exit 1; }
+          python - <<'PY'
+          import requests
+          from PIL import Image
+          print("python deps ok:", requests.__version__, Image.__version__)
+          PY
+          echo "preflight ok"
 
       - name: Write urls.txt
         env:
@@ -103,6 +121,7 @@ jobs:
           DOWNLOAD_HEADERS: ${{ secrets.DOWNLOAD_HEADERS }}
           DOWNLOAD_COOKIE: ${{ secrets.DOWNLOAD_COOKIE }}
           DOWNLOAD_USER_AGENT: ${{ secrets.DOWNLOAD_USER_AGENT }}
+          SEVEN_ZIP_PATH: /usr/bin/7z
         run: |
           ARGS=(--urls urls.txt --output output
                 --quality "$QUALITY"
@@ -125,6 +144,10 @@ jobs:
           du -sh output || true
           find output -name 'bundle-*.zip' -size +1900M -print | while read f; do
             echo "::warning file=$f::超过 1.9GB,Release 可能失败"
+          done
+          # 检查是否有未清理的原始归档（异常退出时可能残留）
+          find output -maxdepth 2 \( -name '*.rar' -o -name '*.7z' \) -print | while read f; do
+            echo "::warning file=$f::原始归档未清理"
           done
 
       - name: Upload artifacts
