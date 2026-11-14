@@ -7,6 +7,11 @@ on:
         description: "下载链接(每行一个,也支持空格分隔,支持多个)"
         required: true
         type: string
+      password:
+        description: "解压密码（RAR/ZIP/7Z 通用，留空则回退到仓库 Secret RAR_PASSWORD）"
+        required: false
+        type: string
+        default: ""
       quality:
         description: "WebP 质量 (1-100)"
         required: false
@@ -80,10 +85,10 @@ jobs:
           pip install -r requirements.txt
           sudo apt-get update
           sudo apt-get install -y webp 7zip unrar
-          cwebp -version
-          unrar | head -n 2 || true
-          7z | head -n 2 || true
-          python -m gallery_dl --version
+          echo "=== cwebp ==="; cwebp -version
+          echo "=== unrar ==="; unrar | head -n 2 || true
+          echo "=== 7z ==="; 7z | head -n 2 || true
+          echo "=== gallery-dl ==="; python -m gallery_dl --version
 
       - name: Preflight check
         run: |
@@ -104,6 +109,10 @@ jobs:
           echo "=== 行数 ==="
           wc -l urls.txt
 
+      - name: Mask password
+        if: ${{ inputs.password != '' }}
+        run: echo "::add-mask::${{ inputs.password }}"
+
       - name: Run process
         env:
           QUALITY: ${{ inputs.quality || '90' }}
@@ -115,7 +124,7 @@ jobs:
           DOWNLOAD_COOKIE: ${{ secrets.DOWNLOAD_COOKIE }}
           DOWNLOAD_USER_AGENT: ${{ secrets.DOWNLOAD_USER_AGENT }}
           SEVEN_ZIP_PATH: /usr/bin/7z
-          RAR_PASSWORD: ${{ secrets.RAR_PASSWORD }}
+          RAR_PASSWORD: ${{ inputs.password || secrets.RAR_PASSWORD }}
         run: |
           ARGS=(--urls urls.txt --output output
                 --quality "$QUALITY"
