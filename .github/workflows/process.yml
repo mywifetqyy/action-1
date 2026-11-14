@@ -1,93 +1,12 @@
-name: Batch Zip -> WebP
-
-on:
-  workflow_dispatch:
-    inputs:
-      urls:
-        description: "下载链接(每行一个,也支持空格分隔,支持多个)"
-        required: true
-        type: string
-      quality:
-        description: "WebP 质量 (1-100)"
-        required: false
-        default: "90"
-      max_size:
-        description: "最大边长(像素,留空表示不缩放)"
-        required: false
-        default: ""
-      compress_level:
-        description: "zip 压缩级别 1-9(越大越慢)"
-        required: false
-        default: "1"
-      downloader:
-        description: "下载器 auto / gallery-dl / requests"
-        required: false
-        default: "auto"
-      bundle_size_mb:
-        description: "每个独立包大小上限(MB),默认 1024=1GB"
-        required: false
-        default: "1024"
-      release_tag:
-        description: "Release tag 名(留空自动 build-<run_number>)"
-        required: false
-        type: string
-        default: ""
-      release_name:
-        description: "Release 标题(留空用 tag 名)"
-        required: false
-        type: string
-        default: ""
-      release_body:
-        description: "Release 说明(留空自动生成)"
-        required: false
-        type: string
-        default: ""
-      release_draft:
-        description: "发布为草稿"
-        required: false
-        type: boolean
-        default: false
-      release_prerelease:
-        description: "标记为预发布"
-        required: false
-        type: boolean
-        default: false
-
-permissions:
-  contents: write
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    concurrency:
-      group: batch-zip-webp
-      cancel-in-progress: false
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          # 图片压缩 + 归档解包（unrar 解 RAR，7z 兜底 zip/7z）
           sudo apt-get update
           sudo apt-get install -y webp 7zip unrar
-          echo "=== cwebp ==="
           cwebp -version
-          echo "=== unrar ==="
-          unrar | head -n 3 || true
-          echo "=== 7z ==="
-          7z | head -n 3 || true
-          echo "=== gallery-dl ==="
+          unrar | head -n 2 || true
+          7z | head -n 2 || true
           python -m gallery_dl --version
 
       - name: Preflight check
@@ -96,23 +15,8 @@ jobs:
           command -v cwebp >/dev/null || { echo "::error::缺少 cwebp"; exit 1; }
           command -v unrar >/dev/null || { echo "::error::缺少 unrar"; exit 1; }
           command -v 7z    >/dev/null || { echo "::error::缺少 7z"; exit 1; }
-          command -v python >/dev/null || { echo "::error::缺少 python"; exit 1; }
-          python - <<'PY'
-          import requests
-          from PIL import Image
-          print("python deps ok:", requests.__version__, Image.__version__)
-          PY
+          python -c "import requests, PIL, pyzipper; print('python deps ok')"
           echo "preflight ok"
-
-      - name: Write urls.txt
-        env:
-          INPUT_URLS: ${{ inputs.urls }}
-        run: |
-          printf '%s' "$INPUT_URLS" | tr -s '[:space:]' '\n' | sed '/^$/d' > urls.txt
-          echo "=== urls.txt ==="
-          cat urls.txt
-          echo "=== 行数 ==="
-          wc -l urls.txt
 
       - name: Run process
         env:
@@ -125,6 +29,7 @@ jobs:
           DOWNLOAD_COOKIE: ${{ secrets.DOWNLOAD_COOKIE }}
           DOWNLOAD_USER_AGENT: ${{ secrets.DOWNLOAD_USER_AGENT }}
           SEVEN_ZIP_PATH: /usr/bin/7z
+          RAR_PASSWORD: ${{ secrets.RAR_PASSWORD }}
         run: |
           ARGS=(--urls urls.txt --output output
                 --quality "$QUALITY"
@@ -136,90 +41,3 @@ jobs:
                 --bundle-size-mb "$BUNDLE_SIZE_MB")
           if [ -n "$MAX_SIZE" ]; then ARGS+=(--max-size "$MAX_SIZE"); fi
           python scripts/process.py "${ARGS[@]}"
-
-      - name: Cleanup downloads
-        if: always()
-        run: rm -rf output/_downloads || true
-
-      - name: Check output size
-        if: always()
-        run: |
-          du -sh output || true
-          find output -name 'bundle-*.zip' -size +1900M -print | while read f; do
-            echo "::warning file=$f::超过 1.9GB,Release 可能失败"
-          done
-          # 检查是否有未清理的原始归档（异常退出时可能残留）
-          find output -maxdepth 2 \( -name '*.rar' -o -name '*.7z' \) -print | while read f; do
-            echo "::warning file=$f::原始归档未清理"
-          done
-
-      - name: Upload artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: webp-zips
-          path: |
-            output/bundle-*.zip
-            output/summary.html
-            output/summary.json
-          if-no-files-found: warn
-
-      - name: Resolve release meta
-        id: rel
-        if: always()
-        env:
-          IN_TAG: ${{ inputs.release_tag }}
-          IN_NAME: ${{ inputs.release_name }}
-          IN_BODY: ${{ inputs.release_body }}
-        run: |
-          TAG="$IN_TAG"
-          if [ -z "$TAG" ]; then
-            TAG="build-${{ github.run_number }}"
-          else
-            TAG=$(printf '%s' "$TAG" \
-              | tr ' ' '-' \
-              | sed -E 's/[~^:?*\[\\]//g; s/\.\.+/-/g; s/-+/-/g; s/^-+//; s/-+$//')
-            if [ -z "$TAG" ]; then
-              echo "::error::release_tag 规范化后为空"
-              exit 1
-            fi
-          fi
-          NAME="$IN_NAME"
-          if [ -z "$NAME" ]; then NAME="$TAG"; fi
-          { echo "tag=$TAG"; echo "name=$NAME"; } >> "$GITHUB_OUTPUT"
-          if [ -n "$IN_BODY" ]; then
-            printf '%s\n' "$IN_BODY" > release_body.md
-            echo "has_body=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_body=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Create Release
-        id: release
-        if: always() && hashFiles('output/bundle-*.zip') != ''
-        continue-on-error: true
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.rel.outputs.tag }}
-          name: ${{ steps.rel.outputs.name }}
-          body_path: ${{ steps.rel.outputs.has_body == 'true' && 'release_body.md' || '' }}
-          generate_release_notes: ${{ steps.rel.outputs.has_body != 'true' }}
-          draft: ${{ inputs.release_draft }}
-          prerelease: ${{ inputs.release_prerelease }}
-          files: |
-            output/bundle-*.zip
-            output/summary.html
-            output/summary.json
-          fail_on_unmatched_files: false
-
-      - name: Retry failed uploads
-        if: always() && steps.release.outcome == 'failure'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.rel.outputs.tag }}
-        run: |
-          echo "Release 上传部分失败,尝试逐个重传..."
-          for f in output/bundle-*.zip output/summary.html output/summary.json; do
-            [ -f "$f" ] || continue
-            gh release upload "$TAG" "$f" --clobber || true
-          done

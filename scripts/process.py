@@ -22,6 +22,13 @@ from datetime import datetime
 import requests
 from PIL import Image
 
+# 可选：支持 AES 加密 zip
+try:
+    import pyzipper
+    HAS_PYZIPPER = True
+except ImportError:
+    HAS_PYZIPPER = False
+
 # 支持的图片扩展名
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".webp"}
 DEFAULT_DOWNLOAD_WORKERS = 5
@@ -32,9 +39,12 @@ FALLBACK_UAS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0 Safari/537.36",
 ]
 
-# 解包工具：rar 优先用 unrar，zip/7z 用 7z
+# 解包工具
 UNRAR = shutil.which("unrar") or shutil.which("unar")
 SEVEN_ZIP = os.environ.get("SEVEN_ZIP_PATH") or shutil.which("7z") or shutil.which("7zz") or shutil.which("7za")
+
+# 固定密码（从环境变量读取，不硬编码）
+RAR_PASSWORD = os.environ.get("RAR_PASSWORD", "").strip()
 
 
 # ==================== 环境配置 ====================
@@ -65,7 +75,6 @@ def parse_extra_headers(raw: str) -> dict:
 
 # ==================== 格式探测 ====================
 def detect_format(path: Path) -> str:
-    """读文件头判断真实归档格式。"""
     try:
         with open(path, "rb") as f:
             head = f.read(8)
@@ -84,7 +93,7 @@ def detect_format(path: Path) -> str:
     return "unknown"
 
 
-# ==================== 文件名解析（严格保留原包名） ====================
+# ==================== 文件名解析 ====================
 def sanitize_name(name: str) -> str:
     name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name)
     name = name.strip().strip(".")
@@ -101,9 +110,8 @@ def derive_filename(url: str, index: int, used: set) -> str:
             break
     if not name:
         name = parsed.path.rstrip("/").split("/")[-1] or f"archive_{index}.zip"
-    name = Path(name).name  # 防止路径穿越
+    name = Path(name).name
 
-    # 剥掉原有压缩扩展名，避免出现 a.rar.zip
     lower = name.lower()
     for ext in (".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".zip"):
         if lower.endswith(ext):
@@ -185,7 +193,6 @@ def download(url: str, dest: Path, timeout: int = 300, downloader: str = "auto",
             print(f"[下载] {dest.name} (尝试 {attempt}/{retries})", flush=True)
             _download_once(url, dest, timeout, downloader, min_interval, env, ua_index=attempt - 1)
 
-            # 下载后立刻校验真实格式
             fmt = detect_format(dest)
             if fmt == "unknown" or fmt == "html":
                 size = dest.stat().st_size if dest.exists() else 0
@@ -204,18 +211,51 @@ def download(url: str, dest: Path, timeout: int = 300, downloader: str = "auto",
     raise RuntimeError(f"重试失败: {last_err}")
 
 
-# ==================== 统一归档读取 ====================
+# ==================== ZIP 解压（支持密码） ====================
+def _extract_zip(path: Path) -> list:
+    """返回 [(成员名, bytes)]。优先 pyzipper（支持 AES），回退 zipfile（仅 ZipCrypto）。"""
+    pwd = RAR_PASSWORD.encode("utf-8") if RAR_PASSWORD else None
+
+    if HAS_PYZIPPER:
+        try:
+            with pyzipper.AESZipFile(path, "r") as z:
+                if pwd:
+                    z.setpassword(pwd)
+                out = []
+                for info in z.infolist():
+                    if info.is_dir():
+                        continue
+                    out.append((info.filename, z.read(info)))
+                return out
+        except Exception as e:
+            if pwd:
+                raise RuntimeError(f"pyzipper 解 zip 失败（密码错误或格式不支持）: {e}")
+            # 没密码时回退标准库
+            pass
+
+    # 回退 zipfile（不支持 AES，但支持 ZipCrypto）
+    with zipfile.ZipFile(path, "r") as z:
+        out = []
+        for info in z.infolist():
+            if info.is_dir():
+                continue
+            if pwd:
+                out.append((info.filename, z.read(info, pwd=pwd)))
+            else:
+                out.append((info.filename, z.read(info)))
+        return out
+
+
+# ==================== RAR 解压（支持密码） ====================
 def _extract_rar(path: Path, tmp: Path):
-    """用 unrar 解压 RAR，失败时回退 7z。"""
+    """unrar 优先，7z 回退。密码通过 -p 传入。"""
+    pwd = RAR_PASSWORD
+    pwd_args = [f"-p{pwd}"] if pwd else ["-p-"]
+    if pwd:
+        print(f"  [密码] 使用预设密码解 RAR", flush=True)
+
     if UNRAR:
-        # unrar: x 保留路径, -o+ 覆盖, -idq 静默
-        # 目标目录必须以 / 结尾
-        cmd = [UNRAR, "x", "-o+", "-idq", str(path), str(tmp) + os.sep]
-        r = subprocess.run(cmd, capture_output=True)
-        if r.returncode == 0:
-            return
-        # 某些 unrar 版本对空密码用 -p-，再试一次
-        cmd = [UNRAR, "x", "-o+", "-idq", "-p-", str(path), str(tmp) + os.sep]
+        cmd = [UNRAR, "x", "-o+", "-idq", *pwd_args, str(path), str(tmp) + os.sep]
         r = subprocess.run(cmd, capture_output=True)
         if r.returncode == 0:
             return
@@ -223,7 +263,7 @@ def _extract_rar(path: Path, tmp: Path):
         print(f"  [unrar 失败] rc={r.returncode}: {err}", file=sys.stderr, flush=True)
 
     if SEVEN_ZIP:
-        cmd = [SEVEN_ZIP, "x", "-y", "-bd", f"-o{tmp}", str(path)]
+        cmd = [SEVEN_ZIP, "x", "-y", "-bd", *pwd_args, f"-o{tmp}", str(path)]
         r = subprocess.run(cmd, capture_output=True)
         if r.returncode == 0:
             return
@@ -233,26 +273,38 @@ def _extract_rar(path: Path, tmp: Path):
     raise RuntimeError("系统里没有 unrar 也没有可用的 7z，无法解 RAR")
 
 
+# ==================== 7Z 解压（支持密码） ====================
+def _extract_7z(path: Path, tmp: Path):
+    """7z 解压，支持密码。"""
+    if not SEVEN_ZIP:
+        raise RuntimeError("检测到 7z，但环境中没有 7z")
+    pwd = RAR_PASSWORD
+    pwd_args = [f"-p{pwd}"] if pwd else ["-p-"]
+    if pwd:
+        print(f"  [密码] 使用预设密码解 7z", flush=True)
+
+    cmd = [SEVEN_ZIP, "x", "-y", "-bd", *pwd_args, f"-o{tmp}", str(path)]
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode != 0:
+        err = r.stderr.decode("utf-8", errors="replace")[:300]
+        raise RuntimeError(f"7z 解压失败 rc={r.returncode}: {err}")
+
+
+# ==================== 统一归档读取 ====================
 def list_archive_members(path: Path) -> list:
-    """返回 [(成员名, 内容bytes)]，支持 zip / rar / 7z。"""
+    """返回 [(成员名, 内容bytes)]，支持 zip / rar / 7z，全部支持密码。"""
     fmt = detect_format(path)
+
     if fmt == "zip":
-        with zipfile.ZipFile(path, "r") as z:
-            return [(i.filename, z.read(i)) for i in z.infolist() if not i.is_dir()]
+        return _extract_zip(path)
 
     if fmt in ("rar", "7z"):
         tmp = Path(tempfile.mkdtemp(prefix="_arc_", dir=path.parent))
         try:
             if fmt == "rar":
                 _extract_rar(path, tmp)
-            else:  # 7z
-                if not SEVEN_ZIP:
-                    raise RuntimeError("检测到 7z，但环境中没有 7z")
-                cmd = [SEVEN_ZIP, "x", "-y", "-bd", f"-o{tmp}", str(path)]
-                r = subprocess.run(cmd, capture_output=True)
-                if r.returncode != 0:
-                    err = r.stderr.decode("utf-8", errors="replace")[:300]
-                    raise RuntimeError(f"7z 解压失败 rc={r.returncode}: {err}")
+            else:
+                _extract_7z(path, tmp)
 
             out = []
             for f in tmp.rglob("*"):
@@ -267,7 +319,7 @@ def list_archive_members(path: Path) -> list:
     raise RuntimeError(f"不支持的归档格式: {fmt}")
 
 
-# ==================== 图片压缩核心逻辑 ====================
+# ==================== 图片压缩 ====================
 def compress_worker(args):
     orig_name, src_path, dst_path, default_quality, max_size = args
     ext = Path(orig_name).suffix.lower()
@@ -339,7 +391,7 @@ def compress_worker(args):
         return (orig_name, False, str(e), info, None)
 
 
-# ==================== 处理单个压缩包并重打包 ====================
+# ==================== 处理单个压缩包 ====================
 def process_one_zip(zip_path: Path, out_root: Path, default_quality, max_size, convert_workers, compress_level):
     out_zip = out_root / zip_path.name
     tmp_dir = out_root / f"_{hashlib.md5(zip_path.name.encode()).hexdigest()[:8]}"
@@ -804,6 +856,11 @@ def main():
     out_root.mkdir(parents=True, exist_ok=True)
     downloads = out_root / "_downloads"
     downloads.mkdir(parents=True, exist_ok=True)
+
+    if RAR_PASSWORD:
+        print(f"[配置] 已加载解压密码（长度 {len(RAR_PASSWORD)}）", flush=True)
+    else:
+        print("[配置] 未设置 RAR_PASSWORD，将按无密码处理", flush=True)
 
     bundler = StreamingBundler(out_root, args.bundle_size_mb * 1024**2, args.compress_level, args.keep_originals)
     done_counter, errors, stats = run_pipeline(urls, downloads, out_root, bundler, args)
