@@ -43,8 +43,41 @@ FALLBACK_UAS = [
 UNRAR = shutil.which("unrar") or shutil.which("unar")
 SEVEN_ZIP = os.environ.get("SEVEN_ZIP_PATH") or shutil.which("7z") or shutil.which("7zz") or shutil.which("7za")
 
-# 固定密码（从环境变量读取，不硬编码）
-RAR_PASSWORD = os.environ.get("RAR_PASSWORD", "").strip()
+
+# ==================== 密码解析 ====================
+def parse_password_list(raw: str) -> list:
+    """把 RAR_PASSWORD 拆成密码列表。支持空格、逗号、分号、换行分隔。"""
+    if not raw:
+        return []
+    return [p for p in re.split(r"[\s,;]+", raw.strip()) if p]
+
+
+RAR_PASSWORDS = parse_password_list(os.environ.get("RAR_PASSWORD", ""))
+
+
+def password_from_name(name: str) -> str | None:
+    """从文件名中的 【YYYY-MM-DD 】 推导 MMDDYY。"""
+    m = re.search(r"【\s*(\d{4})-(\d{2})-(\d{2})", name)
+    if not m:
+        return None
+    yyyy, mm, dd = m.group(1), m.group(2), m.group(3)
+    return f"{mm}{dd}{yyyy[2:]}"
+
+
+def resolve_password(path: Path) -> str | None:
+    """决定该文件用哪个密码。
+    1) 列表只有一个密码 -> 全局用；
+    2) 列表有多个 -> 按文件名日期推导值匹配；
+    3) 未匹配 -> 兜底用第一个。
+    """
+    if not RAR_PASSWORDS:
+        return None
+    if len(RAR_PASSWORDS) == 1:
+        return RAR_PASSWORDS[0]
+    derived = password_from_name(path.name)
+    if derived and derived in RAR_PASSWORDS:
+        return derived
+    return RAR_PASSWORDS[0]
 
 
 # ==================== 环境配置 ====================
@@ -214,7 +247,10 @@ def download(url: str, dest: Path, timeout: int = 300, downloader: str = "auto",
 # ==================== ZIP 解压（支持密码） ====================
 def _extract_zip(path: Path) -> list:
     """返回 [(成员名, bytes)]。优先 pyzipper（支持 AES），回退 zipfile（仅 ZipCrypto）。"""
-    pwd = RAR_PASSWORD.encode("utf-8") if RAR_PASSWORD else None
+    pwd_str = resolve_password(path)
+    pwd = pwd_str.encode("utf-8") if pwd_str else None
+    if pwd_str:
+        print(f"  [密码] ZIP 使用 {pwd_str}", flush=True)
 
     if HAS_PYZIPPER:
         try:
@@ -230,10 +266,7 @@ def _extract_zip(path: Path) -> list:
         except Exception as e:
             if pwd:
                 raise RuntimeError(f"pyzipper 解 zip 失败（密码错误或格式不支持）: {e}")
-            # 没密码时回退标准库
-            pass
 
-    # 回退 zipfile（不支持 AES，但支持 ZipCrypto）
     with zipfile.ZipFile(path, "r") as z:
         out = []
         for info in z.infolist():
@@ -248,11 +281,11 @@ def _extract_zip(path: Path) -> list:
 
 # ==================== RAR 解压（支持密码） ====================
 def _extract_rar(path: Path, tmp: Path):
-    """unrar 优先，7z 回退。密码通过 -p 传入。"""
-    pwd = RAR_PASSWORD
+    """unrar 优先，7z 回退。密码按文件名匹配。"""
+    pwd = resolve_password(path)
     pwd_args = [f"-p{pwd}"] if pwd else ["-p-"]
     if pwd:
-        print(f"  [密码] 使用预设密码解 RAR", flush=True)
+        print(f"  [密码] RAR 使用 {pwd}", flush=True)
 
     if UNRAR:
         cmd = [UNRAR, "x", "-o+", "-idq", *pwd_args, str(path), str(tmp) + os.sep]
@@ -275,13 +308,13 @@ def _extract_rar(path: Path, tmp: Path):
 
 # ==================== 7Z 解压（支持密码） ====================
 def _extract_7z(path: Path, tmp: Path):
-    """7z 解压，支持密码。"""
+    """7z 解压，密码按文件名匹配。"""
     if not SEVEN_ZIP:
         raise RuntimeError("检测到 7z，但环境中没有 7z")
-    pwd = RAR_PASSWORD
+    pwd = resolve_password(path)
     pwd_args = [f"-p{pwd}"] if pwd else ["-p-"]
     if pwd:
-        print(f"  [密码] 使用预设密码解 7z", flush=True)
+        print(f"  [密码] 7z 使用 {pwd}", flush=True)
 
     cmd = [SEVEN_ZIP, "x", "-y", "-bd", *pwd_args, f"-o{tmp}", str(path)]
     r = subprocess.run(cmd, capture_output=True)
@@ -857,8 +890,8 @@ def main():
     downloads = out_root / "_downloads"
     downloads.mkdir(parents=True, exist_ok=True)
 
-    if RAR_PASSWORD:
-        print(f"[配置] 已加载解压密码（长度 {len(RAR_PASSWORD)}）", flush=True)
+    if RAR_PASSWORDS:
+        print(f"[配置] 已加载 {len(RAR_PASSWORDS)} 个密码: {', '.join(RAR_PASSWORDS)}", flush=True)
     else:
         print("[配置] 未设置 RAR_PASSWORD，将按无密码处理", flush=True)
 
