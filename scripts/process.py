@@ -22,14 +22,12 @@ from datetime import datetime
 import requests
 from PIL import Image
 
-# 可选：支持 AES 加密 zip
 try:
     import pyzipper
     HAS_PYZIPPER = True
 except ImportError:
     HAS_PYZIPPER = False
 
-# 支持的图片扩展名
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".webp"}
 DEFAULT_DOWNLOAD_WORKERS = 5
 DEFAULT_UA = "970656489@qq.com"
@@ -39,14 +37,12 @@ FALLBACK_UAS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0 Safari/537.36",
 ]
 
-# 解包工具
 UNRAR = shutil.which("unrar") or shutil.which("unar")
 SEVEN_ZIP = os.environ.get("SEVEN_ZIP_PATH") or shutil.which("7z") or shutil.which("7zz") or shutil.which("7za")
 
 
-# ==================== 密码解析 ====================
+# ==================== 密码候选 ====================
 def parse_password_list(raw: str) -> list:
-    """把 RAR_PASSWORD 拆成密码列表。支持空格、逗号、分号、换行分隔。"""
     if not raw:
         return []
     return [p for p in re.split(r"[\s,;]+", raw.strip()) if p]
@@ -55,29 +51,11 @@ def parse_password_list(raw: str) -> list:
 RAR_PASSWORDS = parse_password_list(os.environ.get("RAR_PASSWORD", ""))
 
 
-def password_from_name(name: str) -> str | None:
-    """从文件名中的 【YYYY-MM-DD 】 推导 MMDDYY。"""
-    m = re.search(r"【\s*(\d{4})-(\d{2})-(\d{2})", name)
-    if not m:
-        return None
-    yyyy, mm, dd = m.group(1), m.group(2), m.group(3)
-    return f"{mm}{dd}{yyyy[2:]}"
-
-
-def resolve_password(path: Path) -> str | None:
-    """决定该文件用哪个密码。
-    1) 列表只有一个密码 -> 全局用；
-    2) 列表有多个 -> 按文件名日期推导值匹配；
-    3) 未匹配 -> 兜底用第一个。
-    """
-    if not RAR_PASSWORDS:
-        return None
-    if len(RAR_PASSWORDS) == 1:
-        return RAR_PASSWORDS[0]
-    derived = password_from_name(path.name)
-    if derived and derived in RAR_PASSWORDS:
-        return derived
-    return RAR_PASSWORDS[0]
+def candidate_passwords(path: Path) -> list:
+    """只返回用户提供的密码列表，逐个尝试，命中即停。不推导、不追加。"""
+    if RAR_PASSWORDS:
+        return list(RAR_PASSWORDS)
+    return [None]
 
 
 # ==================== 环境配置 ====================
@@ -225,13 +203,11 @@ def download(url: str, dest: Path, timeout: int = 300, downloader: str = "auto",
         try:
             print(f"[下载] {dest.name} (尝试 {attempt}/{retries})", flush=True)
             _download_once(url, dest, timeout, downloader, min_interval, env, ua_index=attempt - 1)
-
             fmt = detect_format(dest)
             if fmt == "unknown" or fmt == "html":
                 size = dest.stat().st_size if dest.exists() else 0
                 dest.unlink(missing_ok=True)
                 raise RuntimeError(f"下载内容非法（格式={fmt}, {size} bytes），URL: {url}")
-
             print(f"[下载完成] {dest.name} ({dest.stat().st_size} bytes, 格式={fmt})", flush=True)
             return dest
         except Exception as e:
@@ -244,88 +220,114 @@ def download(url: str, dest: Path, timeout: int = 300, downloader: str = "auto",
     raise RuntimeError(f"重试失败: {last_err}")
 
 
-# ==================== ZIP 解压（支持密码） ====================
-def _extract_zip(path: Path) -> list:
-    """返回 [(成员名, bytes)]。优先 pyzipper（支持 AES），回退 zipfile（仅 ZipCrypto）。"""
-    pwd_str = resolve_password(path)
-    pwd = pwd_str.encode("utf-8") if pwd_str else None
-    if pwd_str:
-        print(f"  [密码] ZIP 使用 {pwd_str}", flush=True)
+# ==================== 清理工具 ====================
+def _clean_dir(d: Path):
+    for f in d.rglob("*"):
+        if f.is_file():
+            try:
+                f.unlink()
+            except OSError:
+                pass
 
-    if HAS_PYZIPPER:
+
+# ==================== ZIP 解压（逐个密码尝试，静默） ====================
+def _extract_zip(path: Path) -> list:
+    candidates = candidate_passwords(path)
+    last_err = None
+
+    for pwd_str in candidates:
+        pwd = pwd_str.encode("utf-8") if pwd_str else None
         try:
-            with pyzipper.AESZipFile(path, "r") as z:
-                if pwd:
-                    z.setpassword(pwd)
-                out = []
-                for info in z.infolist():
-                    if info.is_dir():
-                        continue
-                    out.append((info.filename, z.read(info)))
+            if HAS_PYZIPPER:
+                with pyzipper.AESZipFile(path, "r") as z:
+                    if pwd:
+                        z.setpassword(pwd)
+                    result = [(i.filename, z.read(i)) for i in z.infolist() if not i.is_dir()]
+                print(f"  [命中] ZIP 密码 = {pwd_str or '(无)'}", flush=True)
+                return result
+            else:
+                with zipfile.ZipFile(path, "r") as z:
+                    out = []
+                    for i in z.infolist():
+                        if i.is_dir():
+                            continue
+                        out.append((i.filename, z.read(i, pwd=pwd) if pwd else z.read(i)))
+                print(f"  [命中] ZIP 密码 = {pwd_str or '(无)'}", flush=True)
                 return out
         except Exception as e:
-            if pwd:
-                raise RuntimeError(f"pyzipper 解 zip 失败（密码错误或格式不支持）: {e}")
+            last_err = str(e)
+            continue
 
-    with zipfile.ZipFile(path, "r") as z:
-        out = []
-        for info in z.infolist():
-            if info.is_dir():
-                continue
-            if pwd:
-                out.append((info.filename, z.read(info, pwd=pwd)))
-            else:
-                out.append((info.filename, z.read(info)))
-        return out
+    raise RuntimeError(f"ZIP 所有 {len(candidates)} 个密码均失败，最后错误: {last_err}")
 
 
-# ==================== RAR 解压（支持密码） ====================
+# ==================== RAR 解压（先 t 测密码，命中再 x） ====================
 def _extract_rar(path: Path, tmp: Path):
-    """unrar 优先，7z 回退。密码按文件名匹配。"""
-    pwd = resolve_password(path)
-    pwd_args = [f"-p{pwd}"] if pwd else ["-p-"]
-    if pwd:
-        print(f"  [密码] RAR 使用 {pwd}", flush=True)
+    candidates = candidate_passwords(path)
+    last_err = None
 
     if UNRAR:
-        cmd = [UNRAR, "x", "-o+", "-idq", *pwd_args, str(path), str(tmp) + os.sep]
-        r = subprocess.run(cmd, capture_output=True)
-        if r.returncode == 0:
-            return
-        err = r.stderr.decode("utf-8", errors="replace")[:300]
-        print(f"  [unrar 失败] rc={r.returncode}: {err}", file=sys.stderr, flush=True)
+        tool = "unrar"
+        test_cmd = lambda p: [UNRAR, "t", "-inul", *( [f"-p{p}"] if p else ["-p-"] ), str(path)]
+        extract_cmd = lambda p: [UNRAR, "x", "-o+", "-idq", "-inul", *( [f"-p{p}"] if p else ["-p-"] ), str(path), str(tmp) + os.sep]
+    elif SEVEN_ZIP:
+        tool = "7z"
+        test_cmd = lambda p: [SEVEN_ZIP, "t", "-y", "-bd", "-bso0", "-bsp0", *( [f"-p{p}"] if p else ["-p-"] ), str(path)]
+        extract_cmd = lambda p: [SEVEN_ZIP, "x", "-y", "-bd", "-bso0", "-bsp0", *( [f"-p{p}"] if p else ["-p-"] ), f"-o{tmp}", str(path)]
+    else:
+        raise RuntimeError("系统里没有 unrar 也没有可用的 7z，无法解 RAR")
 
-    if SEVEN_ZIP:
-        cmd = [SEVEN_ZIP, "x", "-y", "-bd", *pwd_args, f"-o{tmp}", str(path)]
-        r = subprocess.run(cmd, capture_output=True)
-        if r.returncode == 0:
-            return
-        err = r.stderr.decode("utf-8", errors="replace")[:300]
-        raise RuntimeError(f"7z 解 rar 失败 rc={r.returncode}: {err}")
+    print(f"  [工具] {tool}，依次测试 {len(candidates)} 个密码", flush=True)
 
-    raise RuntimeError("系统里没有 unrar 也没有可用的 7z，无法解 RAR")
+    for pwd in candidates:
+        # 先 t 测试，失败瞬间返回，不写盘、不打印
+        r = subprocess.run(test_cmd(pwd), capture_output=True)
+        if r.returncode != 0:
+            last_err = r.stderr.decode("utf-8", errors="replace")[:200]
+            continue
+
+        # 命中，真正解压
+        print(f"  [命中] RAR 密码 = {pwd or '(无)'}", flush=True)
+        r2 = subprocess.run(extract_cmd(pwd), capture_output=True)
+        if r2.returncode != 0:
+            err = r2.stderr.decode("utf-8", errors="replace")[:300]
+            raise RuntimeError(f"密码命中但解压失败 rc={r2.returncode}: {err}")
+        return
+
+    _clean_dir(tmp)
+    raise RuntimeError(f"RAR 所有 {len(candidates)} 个密码均失败（工具 {tool}），最后错误: {last_err}")
 
 
-# ==================== 7Z 解压（支持密码） ====================
+# ==================== 7Z 解压（先 t 测密码，命中再 x） ====================
 def _extract_7z(path: Path, tmp: Path):
-    """7z 解压，密码按文件名匹配。"""
     if not SEVEN_ZIP:
         raise RuntimeError("检测到 7z，但环境中没有 7z")
-    pwd = resolve_password(path)
-    pwd_args = [f"-p{pwd}"] if pwd else ["-p-"]
-    if pwd:
-        print(f"  [密码] 7z 使用 {pwd}", flush=True)
+    candidates = candidate_passwords(path)
+    last_err = None
 
-    cmd = [SEVEN_ZIP, "x", "-y", "-bd", *pwd_args, f"-o{tmp}", str(path)]
-    r = subprocess.run(cmd, capture_output=True)
-    if r.returncode != 0:
-        err = r.stderr.decode("utf-8", errors="replace")[:300]
-        raise RuntimeError(f"7z 解压失败 rc={r.returncode}: {err}")
+    print(f"  [工具] 7z，依次测试 {len(candidates)} 个密码", flush=True)
+
+    for pwd in candidates:
+        test_cmd = [SEVEN_ZIP, "t", "-y", "-bd", "-bso0", "-bsp0", *( [f"-p{pwd}"] if pwd else ["-p-"] ), str(path)]
+        r = subprocess.run(test_cmd, capture_output=True)
+        if r.returncode != 0:
+            last_err = r.stderr.decode("utf-8", errors="replace")[:200]
+            continue
+
+        print(f"  [命中] 7Z 密码 = {pwd or '(无)'}", flush=True)
+        extract_cmd = [SEVEN_ZIP, "x", "-y", "-bd", "-bso0", "-bsp0", *( [f"-p{pwd}"] if pwd else ["-p-"] ), f"-o{tmp}", str(path)]
+        r2 = subprocess.run(extract_cmd, capture_output=True)
+        if r2.returncode != 0:
+            err = r2.stderr.decode("utf-8", errors="replace")[:300]
+            raise RuntimeError(f"密码命中但解压失败 rc={r2.returncode}: {err}")
+        return
+
+    _clean_dir(tmp)
+    raise RuntimeError(f"7Z 所有 {len(candidates)} 个密码均失败，最后错误: {last_err}")
 
 
 # ==================== 统一归档读取 ====================
 def list_archive_members(path: Path) -> list:
-    """返回 [(成员名, 内容bytes)]，支持 zip / rar / 7z，全部支持密码。"""
     fmt = detect_format(path)
 
     if fmt == "zip":
@@ -892,6 +894,7 @@ def main():
 
     if RAR_PASSWORDS:
         print(f"[配置] 已加载 {len(RAR_PASSWORDS)} 个密码: {', '.join(RAR_PASSWORDS)}", flush=True)
+        print(f"[配置] 每个压缩包会先用 t 测试密码，命中即解压，最多尝试 {len(RAR_PASSWORDS)} 次", flush=True)
     else:
         print("[配置] 未设置 RAR_PASSWORD，将按无密码处理", flush=True)
 
