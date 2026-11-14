@@ -80,7 +80,7 @@ jobs:
           pip install -r requirements.txt
           # 图片压缩工具 + 归档解包工具（rar/7z 必需 p7zip-full）
           sudo apt-get update
-          sudo apt-get install -y webp p7zip-full
+          sudo apt-get install -y webp 7zip 7zip-rar
           echo "=== cwebp ==="
           cwebp -version
           echo "=== 7z ==="
