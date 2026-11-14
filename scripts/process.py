@@ -11,6 +11,7 @@ import zipfile
 import argparse
 import subprocess
 import threading
+import tempfile
 import multiprocessing as mp
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
@@ -31,6 +32,9 @@ FALLBACK_UAS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0 Safari/537.36",
 ]
 
+SEVEN_ZIP = shutil.which("7z") or shutil.which("7zz") or shutil.which("7za")
+
+
 # ==================== 环境配置 ====================
 def get_download_env():
     return {
@@ -39,12 +43,16 @@ def get_download_env():
         "headers_raw": os.environ.get("DOWNLOAD_HEADERS", "").strip(),
     }
 
+
 def parse_extra_headers(raw: str) -> dict:
-    if not raw: return {}
+    if not raw:
+        return {}
     raw = raw.strip()
     if raw.startswith("{"):
-        try: return {str(k): str(v) for k, v in json.loads(raw).items()}
-        except: pass
+        try:
+            return {str(k): str(v) for k, v in json.loads(raw).items()}
+        except Exception:
+            pass
     headers = {}
     for line in raw.splitlines():
         if ":" in line:
@@ -52,12 +60,34 @@ def parse_extra_headers(raw: str) -> dict:
             headers[k.strip()] = v.strip()
     return headers
 
+
+# ==================== 格式探测 ====================
+def detect_format(path: Path) -> str:
+    """读文件头判断真实归档格式。"""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8)
+    except OSError:
+        return "unknown"
+    if head.startswith(b"PK\x03\x04") or head.startswith(b"PK\x05\x06") or head.startswith(b"PK\x07\x08"):
+        return "zip"
+    if head.startswith(b"Rar!\x1a\x07"):
+        return "rar"
+    if head.startswith(b"7z\xbc\xaf\x27\x1c"):
+        return "7z"
+    if head.startswith(b"\x1f\x8b"):
+        return "gzip"
+    if head.startswith(b"<") or head.startswith(b"\xef\xbb\xbf<"):
+        return "html"
+    return "unknown"
+
+
 # ==================== 文件名解析（严格保留原包名） ====================
 def sanitize_name(name: str) -> str:
-    # 仅处理文件系统绝对无法写入的字符，其余（中文、空格、括号等）全部保留
     name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name)
     name = name.strip().strip(".")
-    return name or "archive.zip"
+    return name or "archive"
+
 
 def derive_filename(url: str, index: int, used: set) -> str:
     parsed = urlparse(url)
@@ -69,10 +99,16 @@ def derive_filename(url: str, index: int, used: set) -> str:
             break
     if not name:
         name = parsed.path.rstrip("/").split("/")[-1] or f"archive_{index}.zip"
-    name = Path(name).name # 防止路径穿越
-    if not name.lower().endswith(".zip"):
-        name = f"{name}.zip"
-    name = sanitize_name(name)
+    name = Path(name).name  # 防止路径穿越
+
+    # 剥掉原有压缩扩展名，避免出现 a.rar.zip
+    lower = name.lower()
+    for ext in (".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".zip"):
+        if lower.endswith(ext):
+            name = name[: -len(ext)]
+            break
+
+    name = sanitize_name(name) + ".zip"
     base, ext = name[:-4], name[-4:]
     candidate, n = name, 1
     while candidate in used:
@@ -81,10 +117,12 @@ def derive_filename(url: str, index: int, used: set) -> str:
     used.add(candidate)
     return candidate
 
+
 # ==================== 下载逻辑 ====================
 def _tmp_dir_for(url: str, base: Path) -> Path:
     h = hashlib.md5(url.encode("utf-8")).hexdigest()[:10]
     return base / f"_gdl_{h}"
+
 
 def _download_once(url: str, dest: Path, timeout: int, downloader: str, min_interval: float, env: dict, ua_index: int = 0) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -99,9 +137,12 @@ def _download_once(url: str, dest: Path, timeout: int, downloader: str, min_inte
             tmp_dir = _tmp_dir_for(url, dest.parent)
             tmp_dir.mkdir(exist_ok=True)
             interval = round(random.uniform(min_interval, min_interval * 1.8), 2)
-            cmd = ["gallery-dl", "--dest", str(tmp_dir), "--no-mtime", "--retries", "3", "--sleep-request", str(interval), "--user-agent", ua]
-            if cookie: cmd += ["--header", f"Cookie: {cookie}"]
-            for k, v in extra_headers.items(): cmd += ["--header", f"{k}: {v}"]
+            cmd = ["gallery-dl", "--dest", str(tmp_dir), "--no-mtime", "--retries", "3",
+                   "--sleep-request", str(interval), "--user-agent", ua]
+            if cookie:
+                cmd += ["--header", f"Cookie: {cookie}"]
+            for k, v in extra_headers.items():
+                cmd += ["--header", f"{k}: {v}"]
             cmd.append(url)
             subprocess.run(cmd, check=True, timeout=timeout, capture_output=True, text=True)
             files = [f for f in tmp_dir.rglob("*") if f.is_file()]
@@ -114,19 +155,25 @@ def _download_once(url: str, dest: Path, timeout: int, downloader: str, min_inte
             return dest
         except Exception as e:
             shutil.rmtree(_tmp_dir_for(url, dest.parent), ignore_errors=True)
-            if downloader == "gallery-dl": raise
+            if downloader == "gallery-dl":
+                raise
 
-    if not use_req: raise RuntimeError(f"下载器 {downloader} 不可用")
+    if not use_req:
+        raise RuntimeError(f"下载器 {downloader} 不可用")
     headers = {"User-Agent": ua}
-    if "pawchive" in url: headers["Referer"] = "https://pawchive.pw/"
+    if "pawchive" in url:
+        headers["Referer"] = "https://pawchive.pw/"
     headers.update(extra_headers)
-    if cookie: headers["Cookie"] = cookie
+    if cookie:
+        headers["Cookie"] = cookie
     with requests.get(url, stream=True, timeout=timeout, headers=headers) as r:
         r.raise_for_status()
         with open(dest, "wb") as f:
             for chunk in r.iter_content(chunk_size=1 << 16):
-                if chunk: f.write(chunk)
+                if chunk:
+                    f.write(chunk)
     return dest
+
 
 def download(url: str, dest: Path, timeout: int = 300, downloader: str = "auto", min_interval: float = 1.0, retries: int = 3) -> Path:
     env = get_download_env()
@@ -135,21 +182,58 @@ def download(url: str, dest: Path, timeout: int = 300, downloader: str = "auto",
         try:
             print(f"[下载] {dest.name} (尝试 {attempt}/{retries})", flush=True)
             _download_once(url, dest, timeout, downloader, min_interval, env, ua_index=attempt - 1)
-            print(f"[下载完成] {dest.name} ({dest.stat().st_size} bytes)", flush=True)
+
+            # 下载后立刻校验真实格式
+            fmt = detect_format(dest)
+            if fmt == "unknown" or fmt == "html":
+                size = dest.stat().st_size if dest.exists() else 0
+                dest.unlink(missing_ok=True)
+                raise RuntimeError(f"下载内容非法（格式={fmt}, {size} bytes），URL: {url}")
+
+            print(f"[下载完成] {dest.name} ({dest.stat().st_size} bytes, 格式={fmt})", flush=True)
             return dest
         except Exception as e:
             last_err = e
             print(f"[下载失败 {attempt}/{retries}] {dest.name}: {e}", file=sys.stderr, flush=True)
-            if dest.exists(): dest.unlink(missing_ok=True)
-            if attempt < retries: time.sleep(2 * attempt)
+            if dest.exists():
+                dest.unlink(missing_ok=True)
+            if attempt < retries:
+                time.sleep(2 * attempt)
     raise RuntimeError(f"重试失败: {last_err}")
+
+
+# ==================== 统一归档读取 ====================
+def list_archive_members(path: Path) -> list:
+    """返回 [(成员名, 内容bytes)]，支持 zip / rar / 7z。"""
+    fmt = detect_format(path)
+    if fmt == "zip":
+        with zipfile.ZipFile(path, "r") as z:
+            return [(i.filename, z.read(i)) for i in z.infolist() if not i.is_dir()]
+    if fmt in ("rar", "7z"):
+        if not SEVEN_ZIP:
+            raise RuntimeError("检测到 rar/7z，但环境中没有 7z（请安装 p7zip-full）")
+        tmp = Path(tempfile.mkdtemp(prefix="_arc_", dir=path.parent))
+        try:
+            subprocess.run([SEVEN_ZIP, "x", "-y", "-bd", f"-o{tmp}", str(path)],
+                           check=True, capture_output=True)
+            out = []
+            for f in tmp.rglob("*"):
+                if f.is_file():
+                    out.append((str(f.relative_to(tmp)), f.read_bytes()))
+            if not out:
+                raise RuntimeError("7z 解包后没有任何文件")
+            return out
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    raise RuntimeError(f"不支持的归档格式: {fmt}")
+
 
 # ==================== 图片压缩核心逻辑 ====================
 def compress_worker(args):
     orig_name, src_path, dst_path, default_quality, max_size = args
     ext = Path(orig_name).suffix.lower()
     size = src_path.stat().st_size
-    
+
     info = {
         "orig_name": orig_name,
         "ext": ext,
@@ -162,26 +246,21 @@ def compress_worker(args):
         "error": None,
     }
 
-    # --- 规则：什么情况不转换 ---
-    
     # 1. 原文件是 webp
     if ext == ".webp":
         info["reason"] = "已是 webp"
         return (orig_name, False, None, info, None)
-        
+
     # 2. PNG <= 800KB
     if ext == ".png" and size <= 800 * 1024:
         info["reason"] = "png 且 <=800KB"
         return (orig_name, False, None, info, None)
-        
+
     # 3. JPG/JPEG <= 700KB
     if ext in (".jpg", ".jpeg") and size <= 700 * 1024:
         info["reason"] = "jpg 且 <=700KB"
         return (orig_name, False, None, info, None)
 
-    # --- 以下为需要转换的规则 ---
-    
-    # 对于 JPG/JPEG 强制使用 90 质量，其他图片（如大 PNG）使用传入的默认质量
     final_q = 90 if ext in (".jpg", ".jpeg") else default_quality
     info["quality"] = final_q
 
@@ -190,28 +269,25 @@ def compress_worker(args):
             im.load()
             info["width"], info["height"] = im.size
             info["mode"] = im.mode
-            
-            # 处理透明通道/色彩模式
+
             if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
                 im = im.convert("RGBA")
             else:
                 im = im.convert("RGB")
-                
-            if max_size: 
+
+            if max_size:
                 im.thumbnail((max_size, max_size), Image.LANCZOS)
 
-            # 用 cwebp 引擎，必须先转存为临时 png
             tmp_png = str(dst_path) + ".png"
             im.save(tmp_png, "PNG")
 
-        # 调用 cwebp：算力 -m 2，开启智能二次采样 -sharp_yuv
         cmd = ["cwebp", "-q", str(final_q), "-m", "2", "-sharp_yuv", tmp_png, "-o", str(dst_path)]
         subprocess.run(cmd, check=True, capture_output=True)
         os.unlink(tmp_png)
 
         new_size = dst_path.stat().st_size
         new_name = str(Path(orig_name).with_suffix(".webp"))
-        
+
         info.update({
             "new_name": new_name,
             "new_size": new_size,
@@ -221,64 +297,61 @@ def compress_worker(args):
         })
         return (orig_name, True, None, info, (new_name, dst_path))
     except Exception as e:
-        if os.path.exists(str(dst_path) + ".png"): os.unlink(str(dst_path) + ".png")
+        if os.path.exists(str(dst_path) + ".png"):
+            os.unlink(str(dst_path) + ".png")
         info["error"] = str(e)
         return (orig_name, False, str(e), info, None)
 
-# ==================== 原样保留 ZIP 结构与重打包 ====================
+
+# ==================== 处理单个压缩包并重打包 ====================
 def process_one_zip(zip_path: Path, out_root: Path, default_quality, max_size, convert_workers, compress_level):
-    # 严格保留原压缩包名
     out_zip = out_root / zip_path.name
     tmp_dir = out_root / f"_{hashlib.md5(zip_path.name.encode()).hexdigest()[:8]}"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    tasks, others = [], []
-    print(f"[处理] {zip_path.name}", flush=True)
+    print(f"[处理] {zip_path.name} (格式={detect_format(zip_path)})", flush=True)
     t0 = time.time()
-    
-    with zipfile.ZipFile(zip_path, 'r') as zin:
-        for item in zin.infolist():
-            if item.is_dir(): continue
-            ext = Path(item.filename).suffix.lower()
-            if ext in IMG_EXTS:
-                # 用哈希作临时文件名，防止原文件名包含非法字符或冲突，最后打包时还原
-                safe_name = hashlib.md5(item.filename.encode('utf-8')).hexdigest() + ext
-                src_temp = tmp_dir / safe_name
-                with zin.open(item) as f_in, open(src_temp, 'wb') as f_out:
-                    shutil.copyfileobj(f_in, f_out)
-                dst_temp = tmp_dir / (safe_name + ".webp")
-                tasks.append((item.filename, src_temp, dst_temp, default_quality, max_size))
-            else:
-                others.append(item)
 
-        results = {}
-        image_stats = []
-        if tasks:
-            with ProcessPoolExecutor(max_workers=convert_workers) as pool:
-                for orig_name, converted, err, info, result_data in pool.map(compress_worker, tasks):
-                    if err: print(f"  [转换失败] {orig_name}: {err}", file=sys.stderr)
-                    if converted and result_data:
-                        results[orig_name] = result_data
-                    else:
-                        # 未转换或失败，找回原图路径
-                        src_temp = next(t[1] for t in tasks if t[0] == orig_name)
-                        results[orig_name] = (orig_name, src_temp)
-                    if info: image_stats.append(info)
+    members = list_archive_members(zip_path)
 
-        # 重新打包：严格保留原始目录结构和文件名
-        with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=compress_level) as zout:
-            for item in others:
-                zout.writestr(item, zin.read(item))
-            
-            for orig_name, (new_name, file_path) in results.items():
-                if orig_name != new_name:
-                    # 替换扩展名，保持路径不变
-                    parts = list(Path(orig_name).parts)
-                    parts[-1] = Path(new_name).name
-                    arcname = str(Path(*parts))
+    tasks, others = [], []
+    for arcname, data in members:
+        ext = Path(arcname).suffix.lower()
+        if ext in IMG_EXTS:
+            safe_name = hashlib.md5(arcname.encode("utf-8")).hexdigest() + ext
+            src_temp = tmp_dir / safe_name
+            src_temp.write_bytes(data)
+            dst_temp = tmp_dir / (safe_name + ".webp")
+            tasks.append((arcname, src_temp, dst_temp, default_quality, max_size))
+        else:
+            others.append((arcname, data))
+
+    results = {}
+    image_stats = []
+    if tasks:
+        with ProcessPoolExecutor(max_workers=convert_workers) as pool:
+            for orig_name, converted, err, info, result_data in pool.map(compress_worker, tasks):
+                if err:
+                    print(f"  [转换失败] {orig_name}: {err}", file=sys.stderr)
+                if converted and result_data:
+                    results[orig_name] = result_data
                 else:
-                    arcname = orig_name
-                zout.write(file_path, arcname)
+                    src_temp = next(t[1] for t in tasks if t[0] == orig_name)
+                    results[orig_name] = (orig_name, src_temp)
+                if info:
+                    image_stats.append(info)
+
+    with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=compress_level) as zout:
+        for arcname, data in others:
+            zout.writestr(arcname, data)
+        for orig_name, (new_name, file_path) in results.items():
+            if orig_name != new_name:
+                parts = list(Path(orig_name).parts)
+                parts[-1] = Path(new_name).name
+                arcname = str(Path(*parts))
+            else:
+                arcname = orig_name
+            zout.write(file_path, arcname)
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -287,8 +360,9 @@ def process_one_zip(zip_path: Path, out_root: Path, default_quality, max_size, c
     skipped = [s for s in image_stats if not s.get("converted") and not s.get("error")]
     failed = [s for s in image_stats if s.get("error")]
     orig_total = sum(s["orig_size"] for s in image_stats)
-    new_total = sum(s["new_size"] for s in image_stats if s.get("converted")) + sum(s["orig_size"] for s in image_stats if not s.get("converted"))
-    
+    new_total = sum(s["new_size"] for s in image_stats if s.get("converted")) + \
+        sum(s["orig_size"] for s in image_stats if not s.get("converted"))
+
     stat = {
         "zip_name": zip_path.name,
         "url": None,
@@ -308,6 +382,7 @@ def process_one_zip(zip_path: Path, out_root: Path, default_quality, max_size, c
     }
     return out_zip, stat
 
+
 # ==================== 流式打包器 ====================
 class StreamingBundler:
     def __init__(self, out_root: Path, max_bytes: int, compress_level: int = 1, keep_originals: bool = False):
@@ -323,13 +398,15 @@ class StreamingBundler:
         self.bundle_records = []
 
     def add(self, zip_path: Path):
-        if not zip_path.exists(): return
+        if not zip_path.exists():
+            return
         size = zip_path.stat().st_size
         with self.lock:
             if size > self.max_bytes:
                 self._flush_locked()
                 self._make_bundle_locked([zip_path])
-                if not self.keep_originals: zip_path.unlink(missing_ok=True)
+                if not self.keep_originals:
+                    zip_path.unlink(missing_ok=True)
                 return
             if self.current_size + size > self.max_bytes and self.queue:
                 self._flush_locked()
@@ -339,10 +416,12 @@ class StreamingBundler:
                 self._flush_locked()
 
     def _flush_locked(self):
-        if not self.queue: return
+        if not self.queue:
+            return
         self._make_bundle_locked(self.queue)
         if not self.keep_originals:
-            for p in self.queue: p.unlink(missing_ok=True)
+            for p in self.queue:
+                p.unlink(missing_ok=True)
         self.queue = []
         self.current_size = 0
 
@@ -350,7 +429,8 @@ class StreamingBundler:
         self.bundle_index += 1
         bundle_path = self.out_root / f"bundle-{self.bundle_index:02d}.zip"
         with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED, compresslevel=self.compress_level) as zf:
-            for f in files: zf.write(f, f.name)
+            for f in files:
+                zf.write(f, f.name)
         total = sum(f.stat().st_size for f in files)
         print(f"[打包] {bundle_path.name}: {len(files)} 个文件, 原始 {total/1024**2:.1f} MB -> 压缩后 {bundle_path.stat().st_size/1024**2:.1f} MB", flush=True)
         self.bundles.append(bundle_path)
@@ -363,20 +443,25 @@ class StreamingBundler:
         })
 
     def finish(self):
-        with self.lock: self._flush_locked()
+        with self.lock:
+            self._flush_locked()
         return self.bundles
+
 
 # ==================== 统计输出 ====================
 def fmt_bytes(n):
-    if n is None: return "-"
+    if n is None:
+        return "-"
     for unit in ("B", "KB", "MB", "GB"):
         if abs(n) < 1024 or unit == "GB":
             return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
         n /= 1024
 
+
 def html_escape(s):
     return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             .replace('"', "&quot;").replace("'", "&#39;"))
+
 
 def write_summary(out_root: Path, stats, bundle_records, done_counter, errors, total_urls):
     json_path = out_root / "summary.json"
@@ -493,7 +578,7 @@ def write_summary(out_root: Path, stats, bundle_records, done_counter, errors, t
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Batch Zip → WebP 统计报告</title>
+<title>Batch Archive → WebP 统计报告</title>
 <style>
   :root {{
     --bg:#0f1419; --panel:#161b22; --panel2:#1c232b; --border:#2d333b;
@@ -541,14 +626,14 @@ def write_summary(out_root: Path, stats, bundle_records, done_counter, errors, t
 </style>
 </head>
 <body>
-  <h1>Batch Zip → WebP 统计报告</h1>
+  <h1>Batch Archive → WebP 统计报告</h1>
   <div class="sub">生成时间：{html_escape(payload['generated_at'])} ｜ URL 总数 {total_urls} ｜ 成功 {done_counter['done']} ｜ 失败 {done_counter['failed']}</div>
 
   <h2>总览</h2>
   <div class="cards">
-    <div class="card"><div class="label">ZIP 文件数</div><div class="value">{len(stats)}</div></div>
-    <div class="card"><div class="label">ZIP 原始总大小</div><div class="value">{fmt_bytes(total_src_zip)}</div></div>
-    <div class="card"><div class="label">ZIP 处理后总大小</div><div class="value">{fmt_bytes(total_out_zip)}</div></div>
+    <div class="card"><div class="label">归档文件数</div><div class="value">{len(stats)}</div></div>
+    <div class="card"><div class="label">归档原始总大小</div><div class="value">{fmt_bytes(total_src_zip)}</div></div>
+    <div class="card"><div class="label">归档处理后总大小</div><div class="value">{fmt_bytes(total_out_zip)}</div></div>
     <div class="card"><div class="label">图片总数</div><div class="value">{total_img}</div>
       <div class="hint">转换 {total_conv} ｜ 跳过 {total_skip} ｜ 失败 <span class="{'err' if total_fail else 'muted'}">{total_fail}</span></div></div>
     <div class="card"><div class="label">图片原始总大小</div><div class="value">{fmt_bytes(total_orig)}</div></div>
@@ -561,10 +646,10 @@ def write_summary(out_root: Path, stats, bundle_records, done_counter, errors, t
   <h2>节省比例</h2>
   {pct_bar(saved_pct)}
 
-  <h2>各 ZIP 汇总</h2>
+  <h2>各归档汇总</h2>
   <table class="tbl">
     <thead><tr>
-      <th>#</th><th>ZIP 文件名</th><th>图片</th><th>转换</th><th>跳过</th><th>失败</th>
+      <th>#</th><th>归档文件名</th><th>图片</th><th>转换</th><th>跳过</th><th>失败</th>
       <th>原始</th><th>处理后</th><th>节省</th><th>耗时</th>
     </tr></thead>
     <tbody>{''.join(zip_rows) if zip_rows else '<tr><td colspan="10" class="empty">无数据</td></tr>'}</tbody>
@@ -585,10 +670,11 @@ def write_summary(out_root: Path, stats, bundle_records, done_counter, errors, t
     <tbody>{''.join(error_rows) if error_rows else '<tr><td colspan="2" class="empty">无错误</td></tr>'}</tbody>
   </table>
 
-  <footer>Batch Zip → WebP · 自动生成</footer>
+  <footer>Batch Archive → WebP · 自动生成</footer>
 </body>
 </html>"""
     (out_root / "summary.html").write_text(html, encoding="utf-8")
+
 
 # ==================== 流水线 ====================
 def run_pipeline(urls, downloads_dir: Path, out_root: Path, bundler: StreamingBundler, args):
@@ -604,16 +690,23 @@ def run_pipeline(urls, downloads_dir: Path, out_root: Path, bundler: StreamingBu
         tasks = [(url, derive_filename(url, i, used)) for i, url in enumerate(urls, 1)]
         from concurrent.futures import ThreadPoolExecutor, as_completed
         with ThreadPoolExecutor(max_workers=args.download_workers) as pool:
-            future_map = {pool.submit(download, url, downloads_dir / name, downloader=args.downloader, min_interval=args.min_request_interval): url for url, name in tasks}
+            future_map = {
+                pool.submit(download, url, downloads_dir / name,
+                            downloader=args.downloader,
+                            min_interval=args.min_request_interval): url
+                for url, name in tasks
+            }
             for fut in as_completed(future_map):
                 url = future_map[fut]
-                try: q.put((url, fut.result()))
+                try:
+                    q.put((url, fut.result()))
                 except Exception as e:
                     with results_lock:
                         errors.append((url, str(e)))
                         done_counter["failed"] += 1
                     print(f"::error::下载失败 {url}: {e}", flush=True)
-        for _ in range(args.convert_workers): q.put(None)
+        for _ in range(args.convert_workers):
+            q.put(None)
 
     def consumer():
         while True:
@@ -623,7 +716,9 @@ def run_pipeline(urls, downloads_dir: Path, out_root: Path, bundler: StreamingBu
                 return
             url, zip_path = item
             try:
-                out_zip, stat = process_one_zip(zip_path, out_root, args.quality, args.max_size, args.convert_workers, args.compress_level)
+                out_zip, stat = process_one_zip(
+                    zip_path, out_root, args.quality, args.max_size,
+                    args.convert_workers, args.compress_level)
                 stat["url"] = url
                 zip_path.unlink(missing_ok=True)
                 bundler.add(out_zip)
@@ -640,17 +735,20 @@ def run_pipeline(urls, downloads_dir: Path, out_root: Path, bundler: StreamingBu
     p = threading.Thread(target=producer, daemon=True)
     consumers = [threading.Thread(target=consumer, daemon=True) for _ in range(args.convert_workers)]
     p.start()
-    for c in consumers: c.start()
+    for c in consumers:
+        c.start()
     p.join()
-    for c in consumers: c.join()
+    for c in consumers:
+        c.join()
     return done_counter, errors, stats
+
 
 # ==================== 主流程 ====================
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--urls", required=True)
     parser.add_argument("--output", default="output")
-    parser.add_argument("--quality", type=int, default=90) # 修改为默认90
+    parser.add_argument("--quality", type=int, default=90)
     parser.add_argument("--max-size", type=int, default=None)
     parser.add_argument("--compress-level", type=int, default=6)
     parser.add_argument("--download-workers", type=int, default=DEFAULT_DOWNLOAD_WORKERS)
@@ -661,8 +759,10 @@ def main():
     parser.add_argument("--keep-originals", action="store_true")
     args = parser.parse_args()
 
-    urls = [ln.strip() for ln in Path(args.urls).read_text(encoding="utf-8").splitlines() if ln.strip() and not ln.strip().startswith("#")]
-    if not urls: return
+    urls = [ln.strip() for ln in Path(args.urls).read_text(encoding="utf-8").splitlines()
+            if ln.strip() and not ln.strip().startswith("#")]
+    if not urls:
+        return
 
     out_root = Path(args.output)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -679,7 +779,9 @@ def main():
     write_summary(out_root, stats, bundler.bundle_records, done_counter, errors, len(urls))
 
     print(f"\n[全部完成] 成功 {done_counter['done']}, 失败 {done_counter['failed']}, 独立包 {len(bundles)} 个", flush=True)
-    if done_counter["done"] == 0 and done_counter["failed"] > 0: sys.exit(1)
+    if done_counter["done"] == 0 and done_counter["failed"] > 0:
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     mp.freeze_support()
