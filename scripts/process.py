@@ -32,7 +32,9 @@ FALLBACK_UAS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0 Safari/537.36",
 ]
 
-SEVEN_ZIP = shutil.which("7z") or shutil.which("7zz") or shutil.which("7za")
+# 解包工具：rar 优先用 unrar，zip/7z 用 7z
+UNRAR = shutil.which("unrar") or shutil.which("unar")
+SEVEN_ZIP = os.environ.get("SEVEN_ZIP_PATH") or shutil.which("7z") or shutil.which("7zz") or shutil.which("7za")
 
 
 # ==================== 环境配置 ====================
@@ -153,7 +155,7 @@ def _download_once(url: str, dest: Path, timeout: int, downloader: str, min_inte
             shutil.move(str(downloaded), str(dest))
             shutil.rmtree(tmp_dir, ignore_errors=True)
             return dest
-        except Exception as e:
+        except Exception:
             shutil.rmtree(_tmp_dir_for(url, dest.parent), ignore_errors=True)
             if downloader == "gallery-dl":
                 raise
@@ -203,28 +205,65 @@ def download(url: str, dest: Path, timeout: int = 300, downloader: str = "auto",
 
 
 # ==================== 统一归档读取 ====================
+def _extract_rar(path: Path, tmp: Path):
+    """用 unrar 解压 RAR，失败时回退 7z。"""
+    if UNRAR:
+        # unrar: x 保留路径, -o+ 覆盖, -idq 静默
+        # 目标目录必须以 / 结尾
+        cmd = [UNRAR, "x", "-o+", "-idq", str(path), str(tmp) + os.sep]
+        r = subprocess.run(cmd, capture_output=True)
+        if r.returncode == 0:
+            return
+        # 某些 unrar 版本对空密码用 -p-，再试一次
+        cmd = [UNRAR, "x", "-o+", "-idq", "-p-", str(path), str(tmp) + os.sep]
+        r = subprocess.run(cmd, capture_output=True)
+        if r.returncode == 0:
+            return
+        err = r.stderr.decode("utf-8", errors="replace")[:300]
+        print(f"  [unrar 失败] rc={r.returncode}: {err}", file=sys.stderr, flush=True)
+
+    if SEVEN_ZIP:
+        cmd = [SEVEN_ZIP, "x", "-y", "-bd", f"-o{tmp}", str(path)]
+        r = subprocess.run(cmd, capture_output=True)
+        if r.returncode == 0:
+            return
+        err = r.stderr.decode("utf-8", errors="replace")[:300]
+        raise RuntimeError(f"7z 解 rar 失败 rc={r.returncode}: {err}")
+
+    raise RuntimeError("系统里没有 unrar 也没有可用的 7z，无法解 RAR")
+
+
 def list_archive_members(path: Path) -> list:
     """返回 [(成员名, 内容bytes)]，支持 zip / rar / 7z。"""
     fmt = detect_format(path)
     if fmt == "zip":
         with zipfile.ZipFile(path, "r") as z:
             return [(i.filename, z.read(i)) for i in z.infolist() if not i.is_dir()]
+
     if fmt in ("rar", "7z"):
-        if not SEVEN_ZIP:
-            raise RuntimeError("检测到 rar/7z，但环境中没有 7z（请安装 p7zip-full）")
         tmp = Path(tempfile.mkdtemp(prefix="_arc_", dir=path.parent))
         try:
-            subprocess.run([SEVEN_ZIP, "x", "-y", "-bd", f"-o{tmp}", str(path)],
-                           check=True, capture_output=True)
+            if fmt == "rar":
+                _extract_rar(path, tmp)
+            else:  # 7z
+                if not SEVEN_ZIP:
+                    raise RuntimeError("检测到 7z，但环境中没有 7z")
+                cmd = [SEVEN_ZIP, "x", "-y", "-bd", f"-o{tmp}", str(path)]
+                r = subprocess.run(cmd, capture_output=True)
+                if r.returncode != 0:
+                    err = r.stderr.decode("utf-8", errors="replace")[:300]
+                    raise RuntimeError(f"7z 解压失败 rc={r.returncode}: {err}")
+
             out = []
             for f in tmp.rglob("*"):
                 if f.is_file():
                     out.append((str(f.relative_to(tmp)), f.read_bytes()))
             if not out:
-                raise RuntimeError("7z 解包后没有任何文件")
+                raise RuntimeError("解包后没有任何文件")
             return out
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
     raise RuntimeError(f"不支持的归档格式: {fmt}")
 
 
@@ -246,17 +285,14 @@ def compress_worker(args):
         "error": None,
     }
 
-    # 1. 原文件是 webp
     if ext == ".webp":
         info["reason"] = "已是 webp"
         return (orig_name, False, None, info, None)
 
-    # 2. PNG <= 800KB
     if ext == ".png" and size <= 800 * 1024:
         info["reason"] = "png 且 <=800KB"
         return (orig_name, False, None, info, None)
 
-    # 3. JPG/JPEG <= 700KB
     if ext in (".jpg", ".jpeg") and size <= 700 * 1024:
         info["reason"] = "jpg 且 <=700KB"
         return (orig_name, False, None, info, None)

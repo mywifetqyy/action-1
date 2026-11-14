@@ -78,11 +78,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          # 图片压缩工具 + 归档解包工具（rar/7z 必需 p7zip-full）
+          # 图片压缩 + 归档解包（unrar 解 RAR，7z 兜底 zip/7z）
           sudo apt-get update
-          sudo apt-get install -y webp 7zip 7zip-rar
+          sudo apt-get install -y webp 7zip unrar
           echo "=== cwebp ==="
           cwebp -version
+          echo "=== unrar ==="
+          unrar | head -n 3 || true
           echo "=== 7z ==="
           7z | head -n 3 || true
           echo "=== gallery-dl ==="
@@ -92,7 +94,8 @@ jobs:
         run: |
           set -e
           command -v cwebp >/dev/null || { echo "::error::缺少 cwebp"; exit 1; }
-          command -v 7z    >/dev/null || { echo "::error::缺少 7z (p7zip-full)"; exit 1; }
+          command -v unrar >/dev/null || { echo "::error::缺少 unrar"; exit 1; }
+          command -v 7z    >/dev/null || { echo "::error::缺少 7z"; exit 1; }
           command -v python >/dev/null || { echo "::error::缺少 python"; exit 1; }
           python - <<'PY'
           import requests
